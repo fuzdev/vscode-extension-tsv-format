@@ -59,7 +59,10 @@ The **workspace folder is treated as the eval root** (the common case where it i
 the repo root). The CLI walks up to the `.git` repo root; the extension does not —
 ignore files in ancestors *above* an opened subdirectory are out of scope (and
 unwatchable from within the folder), so `in_repo` is just "`<folder>/.git`
-exists". A subdir-opened repo therefore falls back to the loose regime
+exists" — re-evaluated on every reload, and a per-folder watcher on that one
+`.git` entry (non-recursive, never `**/.git`) fires a reload when it appears or
+vanishes, so `git init` in an open loose folder flips the regime at once rather
+than at the next ignore-file save. A subdir-opened repo therefore falls back to the loose regime
 (`.formatignore` + heuristic, no `.gitignore`) — the conservative side (it skips
 more, never formats build output the CLI would skip).
 
@@ -99,16 +102,26 @@ pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the r
   prettierignores}` — the `.gitignore` / `.formatignore` / `.prettierignore` texts
   keyed by directory (found via `findFiles`, plus an explicit folder-root read
   since `**/` misses depth 0; `.prettierignore` hierarchically inside a repo, each
-  shadowed per-directory by a sibling `.formatignore`), and the `.git` regime flag
-  — prebuilt off the save path and refreshed via a `FileSystemWatcher` over
-  `**/.{gitignore,prettierignore,formatignore}`. On save it assembles a
+  shadowed per-directory by a sibling `.formatignore`), the `.git` regime flag and
+  the hint set — prebuilt off the save path and refreshed via a `FileSystemWatcher`
+  over `**/.{gitignore,prettierignore,formatignore}` (events under `node_modules`
+  are skipped — `findFiles` never looks there, so they can't change the state) plus
+  the per-folder `.git` watcher. A reload reads every ignore file concurrently, and
+  a per-folder generation counter makes the latest-STARTED reload win: one whose
+  reads finished after a newer one began drops its result, so a burst of events (an
+  editor saving twice, a `git checkout` touching several ignore files) can never
+  leave the earlier snapshot cached. On save it assembles a
   per-document `IgnoreStack` from that cache (synchronously), runs `is_ignored` +
   `is_path_pruned`, and frees it, so the provider stays synchronous. Activation
   **awaits** that initial load before registering the provider, closing the
   startup window where a save could beat the cache; a `findFiles` rejection there
   (likeliest on the web host's virtual FS) is caught and logged, degrading to the
   folder-root ignore files plus the always-on safety-net/heuristic pruning — never
-  aborting activation or formatting everything.
+  aborting activation or formatting everything. A folder added later is loaded
+  without awaiting (the event handler can't hold VS Code), so a document in it
+  saved before that lands formats once un-ignored — left open deliberately, since
+  a silently skipped format would be the worse outcome; removing a folder drops
+  its state, its in-flight reload and its `.git` watcher.
 - `src/extension.node.ts` — Node entry; WASM inits synchronously at import.
 - `src/extension.web.ts` — web entry; reads the bundled `.wasm` via
   `context.extensionUri` + `workspace.fs` and `await init(bytes)` once.

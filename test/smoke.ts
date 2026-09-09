@@ -18,6 +18,9 @@ interface World {
 	dirs: Set<string>;
 	// present files whose read fails (the mock throws a permission error)
 	unreadable: Set<string>;
+	// when set, every `readFile` takes its bytes and then waits on this — holds a
+	// reload in flight so a later-started one can finish first
+	read_gate?: Promise<void>;
 	// when set, the mock's `findFiles` rejects — simulating a web-host virtual-FS error
 	find_files_throws?: boolean;
 }
@@ -75,9 +78,19 @@ const fire_close = (doc: unknown): void =>
 /** Every line written to the Output channel since the current world was installed. */
 const output_lines = (): string[] =>
 	(vscode as unknown as { __get_output_lines(): string[] }).__get_output_lines();
-/** Fire the ignore-file watcher for `rel` (a folder reload, off the save path). */
-const fire_ignore_change = (rel: string): void =>
-	(vscode as unknown as { __fire_ignore_change(rel: string): void }).__fire_ignore_change(rel);
+/** Deliver a watcher event for `rel` to every live watcher whose glob matches it. */
+const fire_watcher = (kind: 'create' | 'change' | 'delete', rel: string): void =>
+	(vscode as unknown as { __fire_watcher(k: string, r: string): void }).__fire_watcher(kind, rel);
+const watcher_patterns = (): string[] =>
+	(vscode as unknown as { __watcher_patterns(): string[] }).__watcher_patterns();
+const fire_workspace_folders_changed = (kind: 'added' | 'removed'): void =>
+	(vscode as unknown as { __fire_workspace_folders_changed(k: string): void }).__fire_workspace_folders_changed(kind);
+/** Whether the live provider skips `rel` (no edits for unformatted content). */
+const is_ignored = (rel: string): boolean =>
+	(get_provider().provideDocumentFormattingEdits(make_doc(rel, 'typescript', UNFORMATTED_TS)) ?? [])
+		.length === 0;
+const IGNORE_GLOB = '**/.{gitignore,prettierignore,formatignore}';
+const GIT_PATTERN = '<folder>/.git';
 /** Let a watcher-triggered reload (a chain of mock-fs awaits) run to completion. */
 const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -161,6 +174,11 @@ const run_scenario = async (
 	}
 	if (while_active) await while_active(world);
 	deactivate_formatter();
+	// VS Code disposes the context's subscriptions on deactivation — do the same, and
+	// hold the extension to leaving no watcher behind (the per-folder `.git` ones are
+	// its own map, disposed through a subscription of their own)
+	for (const subscription of ctx.subscriptions) subscription.dispose();
+	expect(`${name}: no watcher outlives deactivation`, watcher_patterns().length === 0);
 };
 
 // Dispatch + parse-error + status behavior, independent of the ignore files: a
@@ -257,17 +275,17 @@ const main = async (): Promise<void> => {
 			expect_hints('hint: the shadowed root .prettierignore', [shadow_hint('repo')]);
 			// a reload that changes nothing (any ignore-file save fires the watcher)
 			// must not repeat the line
-			fire_ignore_change('.gitignore');
+			fire_watcher('change', '.gitignore');
 			await settle();
 			expect_hints('hint: an unchanged reload logs nothing new', [shadow_hint('repo')]);
 			// fixing the misconfiguration (the shadow removed) is silence, not a line
 			world.files.delete(`${FOLDER}/.formatignore`);
-			fire_ignore_change('.formatignore');
+			fire_watcher('change', '.formatignore');
 			await settle();
 			expect_hints('hint: a resolved shadow logs nothing', [shadow_hint('repo')]);
 			// and re-introducing it is a change, so it is reported once more
 			world.files.set(`${FOLDER}/.formatignore`, 'generated/\n');
-			fire_ignore_change('.formatignore');
+			fire_watcher('change', '.formatignore');
 			await settle();
 			expect_hints('hint: a re-introduced shadow is reported again', [
 				shadow_hint('repo'),
@@ -529,6 +547,122 @@ const main = async (): Promise<void> => {
 	expect_hints('hint: the unreadable .formatignore alone', [
 		unreadable_hint('repo/.formatignore', permission_reason('.formatignore'))
 	]);
+
+	// 11. the `.git` watcher flips the regime: `git init` in an open loose folder
+	//     starts honoring .prettierignore and retires the outside-repo hint (a set
+	//     that shrank to nothing is silence); removing .git reverses it and the hint
+	//     is a change again, so it is logged once more
+	await run_scenario(
+		'.git appearing / vanishing flips the regime',
+		{
+			'.prettierignore': 'p.ts\n',
+			'p.ts': UNFORMATTED_TS,
+			'keep.ts': UNFORMATTED_TS
+		},
+		false,
+		[
+			['p.ts', 'typescript', false], // loose: .prettierignore not read
+			['keep.ts', 'typescript', false]
+		],
+		false,
+		async (world) => {
+			expect(
+				'watchers: the ignore glob and the folder .git entry',
+				same_lines(watcher_patterns().sort(), [IGNORE_GLOB, GIT_PATTERN].sort())
+			);
+			expect_hints('hint: outside-repo before git init', [outside_repo_hint('repo')]);
+			world.dirs.add(`${FOLDER}/.git`);
+			fire_watcher('create', '.git');
+			await settle();
+			expect('git init: .prettierignore now honored', is_ignored('p.ts'));
+			expect_hints('hint: nothing new after git init', [outside_repo_hint('repo')]);
+			world.dirs.delete(`${FOLDER}/.git`);
+			fire_watcher('delete', '.git');
+			await settle();
+			expect('rm .git: back to the loose regime', !is_ignored('p.ts'));
+			expect_hints('hint: outside-repo reported again after rm .git', [
+				outside_repo_hint('repo'),
+				outside_repo_hint('repo')
+			]);
+		}
+	);
+
+	// 12. two reloads in flight: the EARLIER-started one finishes last (its reads are
+	//     held at the gate after taking the old bytes) and must not overwrite the
+	//     later one's state — latest-started wins, whatever order they finish in
+	await run_scenario(
+		'a stale reload finishing last does not win',
+		{
+			'.formatignore': 'a.ts\n',
+			'a.ts': UNFORMATTED_TS,
+			'b.ts': UNFORMATTED_TS
+		},
+		true,
+		[
+			['a.ts', 'typescript', true],
+			['b.ts', 'typescript', false]
+		],
+		false,
+		async (world) => {
+			let release = (): void => {};
+			world.read_gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			fire_watcher('change', '.formatignore'); // reload A: reads `a.ts`, then waits
+			await settle();
+			world.read_gate = undefined;
+			world.files.set(`${FOLDER}/.formatignore`, 'b.ts\n');
+			fire_watcher('change', '.formatignore'); // reload B: reads `b.ts`, finishes
+			await settle();
+			expect('race: the later reload landed', is_ignored('b.ts') && !is_ignored('a.ts'));
+			release();
+			await settle();
+			expect('race: the earlier reload was discarded', is_ignored('b.ts') && !is_ignored('a.ts'));
+		}
+	);
+
+	// 13. workspace folder removed / re-added: its state and .git watcher go with it
+	//     and come back with the reload
+	await run_scenario(
+		'folder removed and re-added',
+		{
+			'.gitignore': 'dist/\n',
+			'dist/out.ts': UNFORMATTED_TS
+		},
+		true,
+		[['dist/out.ts', 'typescript', true]],
+		false,
+		async (world) => {
+			// an ignore file under node_modules can't change the state (findFiles never
+			// looks there), so its event must not cost a reload: plant a change the
+			// reload WOULD pick up, fire the node_modules event, and expect nothing
+			world.files.set(`${FOLDER}/.formatignore`, 'planted.ts\n');
+			world.files.set(`${FOLDER}/planted.ts`, UNFORMATTED_TS);
+			world.files.set(`${FOLDER}/node_modules/pkg/.gitignore`, '*\n');
+			world.dirs.add(`${FOLDER}/node_modules`);
+			world.dirs.add(`${FOLDER}/node_modules/pkg`);
+			fire_watcher('change', 'node_modules/pkg/.gitignore');
+			await settle();
+			expect('node_modules event: no reload', !is_ignored('planted.ts'));
+			fire_watcher('change', '.formatignore');
+			await settle();
+			expect('a real event: reloaded', is_ignored('planted.ts'));
+
+			fire_workspace_folders_changed('removed');
+			expect('removed: state dropped, nothing ignored', !is_ignored('dist/out.ts'));
+			expect(
+				'removed: its .git watcher disposed',
+				same_lines(watcher_patterns(), [IGNORE_GLOB])
+			);
+			fire_workspace_folders_changed('added');
+			await settle();
+			expect('re-added: state reloaded', is_ignored('dist/out.ts'));
+			expect(
+				're-added: .git watcher back',
+				same_lines(watcher_patterns().sort(), [IGNORE_GLOB, GIT_PATTERN].sort())
+			);
+		}
+	);
 
 	console.log(`${pass} passed, ${fail} failed`);
 	if (fail > 0) process.exit(1);

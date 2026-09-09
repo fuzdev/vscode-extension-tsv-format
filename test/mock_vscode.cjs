@@ -98,25 +98,43 @@ const workspace = {
 					code: 'NoPermissions'
 				});
 			}
+			// the bytes are taken BEFORE the gate, so a reload held here has already
+			// read the world as it was when it started — how a test makes an earlier
+			// reload finish after a later one
+			if (world.read_gate) await world.read_gate;
 			return typeof content === 'string' ? enc.encode(content) : content;
 		}
 	},
-	createFileSystemWatcher() {
-		// the extension registers one listener for all three events; keep the
-		// change one so a test can fire an ignore-file reload (`__fire_ignore_change`)
-		const sub = () => ({ dispose() {} });
+	// watchers are kept with their pattern so `__fire_watcher` delivers an event only
+	// to the ones whose glob matches, as VS Code does — the ignore-file glob and the
+	// per-folder `.git` pattern must not hear each other's events
+	createFileSystemWatcher(pattern) {
+		const watcher = { pattern, create: [], change: [], delete: [] };
+		watchers.push(watcher);
+		const on = (kind) => (listener) => {
+			watcher[kind].push(listener);
+			return {
+				dispose() {
+					watcher[kind] = watcher[kind].filter((l) => l !== listener);
+				}
+			};
+		};
 		return {
-			onDidCreate: sub,
-			onDidChange(listener) {
-				ignore_change_listener = listener;
-				return { dispose() {} };
-			},
-			onDidDelete: sub,
-			dispose() {}
+			onDidCreate: on('create'),
+			onDidChange: on('change'),
+			onDidDelete: on('delete'),
+			dispose() {
+				watchers = watchers.filter((w) => w !== watcher);
+			}
 		};
 	},
-	onDidChangeWorkspaceFolders() {
-		return { dispose() {} };
+	onDidChangeWorkspaceFolders(listener) {
+		workspace_folders_listener = listener;
+		return {
+			dispose() {
+				if (workspace_folders_listener === listener) workspace_folders_listener = undefined;
+			}
+		};
 	},
 	onDidCloseTextDocument(listener) {
 		close_listener = listener;
@@ -134,8 +152,22 @@ const workspace = {
 // every line the extension writes to its Output channel, so a test can assert on the
 // ignore-file hints (which are logged, never thrown or shown)
 let output_lines = [];
-// the watcher's change listener, so a test can trigger a folder reload
-let ignore_change_listener;
+// the live file-system watchers (see `createFileSystemWatcher`)
+let watchers = [];
+let workspace_folders_listener;
+
+/** Whether a watcher's glob matches a path — the two shapes the extension uses:
+ * `**​/.{a,b,c}` (a basename set anywhere) and `RelativePattern(folder, '.git')`
+ * (one exact entry directly under the folder). */
+const watcher_matches = (pattern, uri_path) => {
+	if (pattern instanceof RelativePattern) {
+		return uri_path === `${pattern.folder.uri.path}/${pattern.pattern}`;
+	}
+	const m = /^\*\*\/\.\{([^}]*)\}$/.exec(pattern);
+	if (!m) throw new Error(`mock: unsupported watcher glob ${pattern}`);
+	const basename = uri_path.slice(uri_path.lastIndexOf('/') + 1);
+	return m[1].split(',').some((name) => `.${name}` === basename);
+};
 
 const window = {
 	createOutputChannel() {
@@ -192,13 +224,29 @@ module.exports = {
 	__set_world(w) {
 		world = w;
 		output_lines = [];
+		watchers = [];
+		workspace_folders_listener = undefined;
 	},
 	__get_output_lines() {
 		return output_lines;
 	},
-	/** Fire the ignore-file watcher for `rel` under the folder root (a reload). */
-	__fire_ignore_change(rel) {
-		ignore_change_listener?.(Uri.file(`${world.folder_path}/${rel}`));
+	/** Deliver a `create` / `change` / `delete` event for `rel` under the folder root
+	 * to every live watcher whose pattern matches it. */
+	__fire_watcher(kind, rel) {
+		const uri = Uri.file(`${world.folder_path}/${rel}`);
+		for (const watcher of watchers) {
+			if (!watcher_matches(watcher.pattern, uri.path)) continue;
+			for (const listener of watcher[kind]) listener(uri);
+		}
+	},
+	/** The live (undisposed) watchers' patterns, so a test can assert on disposal. */
+	__watcher_patterns() {
+		return watchers.map((w) => (typeof w.pattern === 'string' ? w.pattern : `<folder>/${w.pattern.pattern}`));
+	},
+	/** Fire the workspace-folders listener with the one mock folder added/removed. */
+	__fire_workspace_folders_changed(kind) {
+		const folder = folders()[0];
+		workspace_folders_listener?.({ added: kind === 'added' ? [folder] : [], removed: kind === 'removed' ? [folder] : [] });
 	},
 	__get_provider() {
 		return captured_provider;
