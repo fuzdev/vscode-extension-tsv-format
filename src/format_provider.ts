@@ -22,10 +22,14 @@ export interface TsvFormatters {
  * freed per document (never unwound while traversing), so the package's
  * `pop_gitignore` / `pop_tsv` are omitted — as are `is_empty`, `should_format_file`
  * (the extension dispatches by `languageId`, not by extension, so it never needs
- * that helper's filter), `heuristic_shadow_warning` (the extension prunes silently,
- * no stderr hint), and `classify_dir` (the per-directory verdict for a top-down
- * *traverser*; the extension has no traversal and uses the per-file
- * `is_path_pruned` instead).
+ * that helper's filter), `heuristic_shadow_warning` (the extension prunes silently —
+ * that hint is about a `.gitignore` turning the build-output heuristic off, which
+ * changes nothing a user configured), and `classify_dir` (the per-directory verdict
+ * for a top-down *traverser*; the extension has no traversal and uses the per-file
+ * `is_path_pruned` instead). The two **`.prettierignore`** hints are typed and used:
+ * each names an ignore file whose rules go unread, which is a silent
+ * misconfiguration rather than a pruning detail, so `report_ignore_hints` logs them
+ * to the Output channel exactly as the CLI writes them to stderr.
  */
 export interface IgnoreStack {
 	push_gitignore(anchor: string, content: string): void;
@@ -44,6 +48,29 @@ export interface IgnoreStack {
 	 * `is_ignored(rel, false)` for the file-level match.
 	 */
 	is_path_pruned(rel: string): boolean;
+	/**
+	 * The heads-up text for a `.prettierignore` at a target root **outside** a git
+	 * repo, where tsv reads only `.formatignore` and those rules therefore go unread;
+	 * `undefined` when there is nothing to say. The receiver is unused — the package
+	 * exposes it as a method so it rides the `IgnoreStack` class through the facade.
+	 */
+	prettierignore_outside_repo_warning(
+		dir: string,
+		in_repo: boolean,
+		has_prettierignore: boolean,
+		has_formatignore: boolean
+	): string | undefined;
+	/**
+	 * The heads-up text for a directory holding both a `.formatignore` and a
+	 * `.prettierignore` **inside** a repo, where the sibling `.formatignore` shadows
+	 * the `.prettierignore`; `undefined` otherwise. Same shape as above.
+	 */
+	prettierignore_shadowed_warning(
+		dir: string,
+		in_repo: boolean,
+		has_prettierignore: boolean,
+		has_formatignore: boolean
+	): string | undefined;
 	free(): void;
 }
 
@@ -89,6 +116,10 @@ interface FolderIgnore {
 	// each shadowed per-directory by a sibling `.formatignore` in `tsv_layer_for_dir`.
 	// Empty outside a repo.
 	prettierignores: Map<string, string>;
+	// the `.prettierignore` heads-ups this state carries (see `ignore_hints`), kept so
+	// a reload that changes nothing re-logs nothing — the watcher fires on every
+	// ignore-file save, and the same unread file is one line, not one per save
+	hints: string[];
 }
 
 // gitignore-aware discovery: the prebuilt ignore state per workspace folder,
@@ -206,6 +237,9 @@ const reload_ignore_folder = async (folder: vscode.WorkspaceFolder): Promise<voi
 
 	const gitignores = new Map<string, string>();
 	const prettierignores = new Map<string, string>();
+	// outside a repo `.prettierignore` is never READ (only `.formatignore` is), but its
+	// presence is exactly what the outside-repo hint is about, so ask once either way
+	let root_prettierignore_present = false;
 	if (in_repo) {
 		for (const [dir, text] of await find_ignore_files(folder, gitignore_file_name)) {
 			gitignores.set(dir, text);
@@ -230,12 +264,97 @@ const reload_ignore_folder = async (folder: vscode.WorkspaceFolder): Promise<voi
 		}
 	}
 
-	folder_ignores.set(folder.uri.toString(), {
+	if (in_repo) {
+		root_prettierignore_present = prettierignores.has('');
+	} else {
+		root_prettierignore_present =
+			(await read_ignore_file(vscode.Uri.joinPath(folder.uri, prettierignore_file_name))) !==
+			undefined;
+	}
+
+	const hints = ignore_hints(
+		folder,
+		in_repo,
+		formatignores,
+		prettierignores,
+		root_prettierignore_present
+	);
+	const key = folder.uri.toString();
+	const previous = folder_ignores.get(key);
+	folder_ignores.set(key, {
 		in_repo,
 		gitignores,
 		formatignores,
-		prettierignores
+		prettierignores,
+		hints
 	});
+	// log the set only when it changed — a reload the watcher fires for an unrelated
+	// `.gitignore` save carries the same hints, and repeating them is noise; a set
+	// that shrank to nothing is silence, not a line (nothing is unread any more)
+	if (hints.length > 0 && (previous === undefined || !same_lines(previous.hints, hints))) {
+		for (const hint of hints) {
+			output_channel?.appendLine(`[${new Date().toISOString()}] ${hint}`);
+		}
+	}
+};
+
+const same_lines = (a: string[], b: string[]): boolean =>
+	a.length === b.length && a.every((line, i) => line === b[i]);
+
+/**
+ * The `.prettierignore` heads-ups tsv's CLI writes to stderr — an ignore file
+ * whose rules go unread, which is a silent misconfiguration the editor would
+ * otherwise never surface. Two cases, both phrased by the shared matcher so the
+ * wording cannot drift from the CLI's:
+ *
+ * - **Outside a repo**, a `.prettierignore` at the folder root is not read at all
+ *   (only `.formatignore` is), unless a sibling `.formatignore` already explains it.
+ * - **Inside a repo**, a directory holding both files has its `.prettierignore`
+ *   shadowed by the sibling `.formatignore`.
+ *
+ * Computed off the save path (a folder reload only) and logged by the caller to
+ * the Output channel, which is not revealed — a hint is information, not a
+ * failure, so it must not steal focus from the parse-error indicator.
+ * Best-effort: a stack that cannot be built is simply no hint. Sorted, so an
+ * unchanged tree yields an identical list whatever order `findFiles` returned.
+ */
+const ignore_hints = (
+	folder: vscode.WorkspaceFolder,
+	in_repo: boolean,
+	formatignores: Map<string, string>,
+	prettierignores: Map<string, string>,
+	root_prettierignore_present: boolean
+): string[] => {
+	const hints: string[] = [];
+	if (!ignore_stack_ctor) return hints;
+	const stack = new ignore_stack_ctor();
+	try {
+		if (in_repo) {
+			// per directory: both files present means the tsv layer read the .formatignore
+			for (const dir of prettierignores.keys()) {
+				const hint = stack.prettierignore_shadowed_warning(
+					dir === '' ? folder.name : `${folder.name}/${dir}`,
+					true,
+					true,
+					formatignores.has(dir)
+				);
+				if (hint !== undefined) hints.push(hint);
+			}
+		} else {
+			// outside a repo the cache holds no .prettierignore at all (it is never
+			// read), so the folder-root file's presence is the one thing to ask about
+			const hint = stack.prettierignore_outside_repo_warning(
+				folder.name,
+				false,
+				root_prettierignore_present,
+				formatignores.has('')
+			);
+			if (hint !== undefined) hints.push(hint);
+		}
+	} finally {
+		stack.free();
+	}
+	return hints.sort();
 };
 
 const clear_ignore_folder = (folder: vscode.WorkspaceFolder): void => {

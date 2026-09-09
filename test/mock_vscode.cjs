@@ -90,8 +90,18 @@ const workspace = {
 		}
 	},
 	createFileSystemWatcher() {
+		// the extension registers one listener for all three events; keep the
+		// change one so a test can fire an ignore-file reload (`__fire_ignore_change`)
 		const sub = () => ({ dispose() {} });
-		return { onDidCreate: sub, onDidChange: sub, onDidDelete: sub, dispose() {} };
+		return {
+			onDidCreate: sub,
+			onDidChange(listener) {
+				ignore_change_listener = listener;
+				return { dispose() {} };
+			},
+			onDidDelete: sub,
+			dispose() {}
+		};
 	},
 	onDidChangeWorkspaceFolders() {
 		return { dispose() {} };
@@ -109,9 +119,21 @@ const workspace = {
 	}
 };
 
+// every line the extension writes to its Output channel, so a test can assert on the
+// ignore-file hints (which are logged, never thrown or shown)
+let output_lines = [];
+// the watcher's change listener, so a test can trigger a folder reload
+let ignore_change_listener;
+
 const window = {
 	createOutputChannel() {
-		return { appendLine() {}, show() {}, dispose() {} };
+		return {
+			appendLine(line) {
+				output_lines.push(line);
+			},
+			show() {},
+			dispose() {}
+		};
 	},
 	createStatusBarItem() {
 		status_item = {
@@ -157,6 +179,14 @@ module.exports = {
 	// test hooks
 	__set_world(w) {
 		world = w;
+		output_lines = [];
+	},
+	__get_output_lines() {
+		return output_lines;
+	},
+	/** Fire the ignore-file watcher for `rel` under the folder root (a reload). */
+	__fire_ignore_change(rel) {
+		ignore_change_listener?.(Uri.file(`${world.folder_path}/${rel}`));
 	},
 	__get_provider() {
 		return captured_provider;

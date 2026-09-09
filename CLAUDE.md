@@ -29,6 +29,20 @@ apart, and a save-hook would break the sync design, so both skip — matching
 prettier-vscode. The ignore files are the one config input; they govern *which*
 files format, never *how*.
 
+Where the CLI writes a `.prettierignore` heads-up to stderr, the extension writes the
+same line — phrased by the shared matcher, never templated here — to its **Output
+channel**: outside a repo a lone root `.prettierignore` is not read at all, and inside
+a repo one shadowed by a sibling `.formatignore` is not read in that directory. Both
+are silent misconfigurations a user cannot otherwise see. The channel is not revealed
+for them (a hint is information, not a failure, and must not steal focus from the
+parse-error indicator), and they are computed on a folder reload, never on the save
+path. The hint set is part of the folder's cached state and is logged only when it
+changes — the watcher fires on every ignore-file save, and an unread file is one line,
+not one per save; a set that shrinks to nothing is silence, not a line. The
+`heuristic_shadow_warning` hint is deliberately *not* surfaced — it reports
+a `.gitignore` turning the build-output heuristic off, which changes nothing the user
+configured.
+
 The **workspace folder is treated as the eval root** (the common case where it is
 the repo root). The CLI walks up to the `.git` repo root; the extension does not —
 ignore files in ancestors *above* an opened subdirectory are out of scope (and
@@ -52,14 +66,24 @@ shared-policy seam it previously kept; it briefly used the per-directory
 `is_ignored(rel, false) || is_path_pruned(rel)`. (`classify_dir` stays the CLI's
 per-directory primitive for a real top-down walk; the extension has none.)
 
+One thing the CLI decides that the extension cannot: `tsv format` reads a path's own
+extension and parses `.mjs`/`.mts` as **modules with no script retry**, since those are ES
+modules by name. The extension has no path — it dispatches on `languageId`, where `.mjs`
+arrives as `javascript` and `.mts` as `typescript` — and calls the bare
+`format_typescript(source)`, which takes the module-then-script fallback. So a `.mjs`
+holding a legacy sloppy script (a `with` statement, a leading-zero literal) is
+unformattable from the CLI and formats on save here. Closing that would mean threading
+the file name into the dispatch and passing `{sourceType: 'module'}` — an option the
+pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the range bump.
+
 ## Layout
 
 - `src/format_provider.ts` — host-agnostic core: the provider, languageId →
   `format_*` dispatch (ts/js/css/svelte only), `.svelte` fileName fallback (now
   defensive — the manifest `contributes.languages` owns the `.svelte` → `svelte`
   association, so the id is present even without the Svelte extension),
-  status-bar + `tsv` Output channel for parse failures, and the gitignore-aware
-  skip logic. Per workspace folder it caches `{in_repo, gitignores, formatignores,
+  status-bar + `tsv` Output channel for parse failures and the `.prettierignore`
+  heads-ups, and the gitignore-aware skip logic. Per workspace folder it caches `{in_repo, gitignores, formatignores,
   prettierignores}` — the `.gitignore` / `.formatignore` / `.prettierignore` texts
   keyed by directory (found via `findFiles`, plus an explicit folder-root read
   since `**/` misses depth 0; `.prettierignore` hierarchically inside a repo, each

@@ -60,6 +60,35 @@ const get_status = (): { visible: boolean; text: string } =>
 	).__get_status_item();
 const fire_close = (doc: unknown): void =>
 	(vscode as unknown as { __fire_close(d: unknown): void }).__fire_close(doc);
+/** Every line written to the Output channel since the current world was installed. */
+const output_lines = (): string[] =>
+	(vscode as unknown as { __get_output_lines(): string[] }).__get_output_lines();
+/** Fire the ignore-file watcher for `rel` (a folder reload, off the save path). */
+const fire_ignore_change = (rel: string): void =>
+	(vscode as unknown as { __fire_ignore_change(rel: string): void }).__fire_ignore_change(rel);
+/** Let a watcher-triggered reload (a chain of mock-fs awaits) run to completion. */
+const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+// The hint texts come from the package itself — the extension never templates
+// them, so the test asserts the shared matcher's exact line rather than a phrase.
+const with_stack = <T>(f: (stack: IgnoreStack) => T): T => {
+	const stack = new IgnoreStack();
+	try {
+		return f(stack);
+	} finally {
+		stack.free();
+	}
+};
+const shadow_hint = (dir: string): string =>
+	with_stack((s) => s.prettierignore_shadowed_warning(dir, true, true, true)) ?? '';
+const outside_repo_hint = (dir: string): string =>
+	with_stack((s) => s.prettierignore_outside_repo_warning(dir, false, true, false)) ?? '';
+/** The Output lines are `[<iso timestamp>] <hint>`; compare on the hint alone. */
+const hint_lines = (): string[] => output_lines().map((line) => line.replace(/^\[[^\]]*\] /, ''));
+const expect_hints = (label: string, expected: string[]): void =>
+	expect(`${label}: ${JSON.stringify(hint_lines())}`, same_lines(hint_lines(), expected));
+const same_lines = (a: string[], b: string[]): boolean =>
+	a.length === b.length && a.every((line, i) => line === b[i]);
 
 /** A minimal mock `TextDocument` for one path / language / content. */
 const make_doc = (rel: string, languageId: string, content: string) => ({
@@ -92,9 +121,13 @@ const run_scenario = async (
 	files: Record<string, string>,
 	is_repo: boolean,
 	cases: Array<[string, string, boolean]>,
-	find_files_throws = false
+	find_files_throws = false,
+	// runs while the extension is still active, with the world for in-place edits —
+	// the one way to exercise a watcher reload against the cached state
+	while_active?: (world: World) => Promise<void>
 ): Promise<void> => {
-	set_world(build_world(files, is_repo, find_files_throws));
+	const world = build_world(files, is_repo, find_files_throws);
+	set_world(world);
 	const ctx = make_context();
 	// activation awaits the initial ignore-file load, so the cache is ready here
 	await activate_formatter(ctx as never, formatters, IgnoreStack as never);
@@ -109,6 +142,7 @@ const run_scenario = async (
 		const edits = provider.provideDocumentFormattingEdits(make_doc(rel, languageId, content)) ?? [];
 		check(`${name}: ${rel}`, edits.length === 0, expected);
 	}
+	if (while_active) await while_active(world);
 	deactivate_formatter();
 };
 
@@ -180,6 +214,8 @@ const main = async (): Promise<void> => {
 			['src/app.ts', 'typescript', false]
 		]
 	);
+	// no .prettierignore anywhere: nothing is unread, so nothing is logged
+	expect_hints('hint: none for a plain gitignore repo', []);
 
 	// 2. .formatignore shadows .prettierignore (repo)
 	await run_scenario(
@@ -196,7 +232,31 @@ const main = async (): Promise<void> => {
 			['generated/skip.ts', 'typescript', true],
 			['p_only.ts', 'typescript', false],
 			['keep.ts', 'typescript', false]
-		]
+		],
+		false,
+		async (world) => {
+			// the shadowing is silent in behavior, so the Output channel is where a
+			// user can see it — the shared matcher's exact line, as the CLI's stderr
+			expect_hints('hint: the shadowed root .prettierignore', [shadow_hint('repo')]);
+			// a reload that changes nothing (any ignore-file save fires the watcher)
+			// must not repeat the line
+			fire_ignore_change('.gitignore');
+			await settle();
+			expect_hints('hint: an unchanged reload logs nothing new', [shadow_hint('repo')]);
+			// fixing the misconfiguration (the shadow removed) is silence, not a line
+			world.files.delete(`${FOLDER}/.formatignore`);
+			fire_ignore_change('.formatignore');
+			await settle();
+			expect_hints('hint: a resolved shadow logs nothing', [shadow_hint('repo')]);
+			// and re-introducing it is a change, so it is reported once more
+			world.files.set(`${FOLDER}/.formatignore`, 'generated/\n');
+			fire_ignore_change('.formatignore');
+			await settle();
+			expect_hints('hint: a re-introduced shadow is reported again', [
+				shadow_hint('repo'),
+				shadow_hint('repo')
+			]);
+		}
 	);
 
 	// 3. hierarchical .gitignore re-include
@@ -216,6 +276,7 @@ const main = async (): Promise<void> => {
 			['a.gen.ts', 'typescript', true]
 		]
 	);
+	expect_hints('hint: none for hierarchical gitignores', []);
 
 	// 4. hierarchical .formatignore (nested layer + deeper re-include)
 	await run_scenario(
@@ -265,6 +326,9 @@ const main = async (): Promise<void> => {
 			['b/bp.ts', 'typescript', false] // b/.prettierignore shadowed by sibling b/.formatignore
 		]
 	);
+	// only b/ holds both files: one hint, naming that directory, and none for the
+	// root or sub/ .prettierignore, which are read
+	expect_hints('hint: exactly the shadowed b/.prettierignore', [shadow_hint('repo/b')]);
 
 	// 5. loose (non-repo): .formatignore honored; .gitignore/.prettierignore NOT read;
 	//    heuristic ON (build/dist/hidden skipped)
@@ -291,6 +355,22 @@ const main = async (): Promise<void> => {
 			['keep.ts', 'typescript', false]
 		]
 	);
+	// the sibling .formatignore already explains the unread .prettierignore: no hint
+	expect_hints('hint: none when a .formatignore sits beside it', []);
+
+	// 5b. loose (non-repo) with a LONE .prettierignore: tsv reads only .formatignore
+	//     outside a repo, so those rules go unread — the one case the outside-repo hint
+	//     fires (a sibling .formatignore would already explain it, as in scenario 5)
+	await run_scenario(
+		'loose: lone prettierignore is unread',
+		{
+			'.prettierignore': 'keep.ts\n',
+			'keep.ts': UNFORMATTED_TS
+		},
+		false,
+		[['keep.ts', 'typescript', false]]
+	);
+	expect_hints('hint: the lone .prettierignore outside a repo', [outside_repo_hint('repo')]);
 
 	// 6. loose: a .formatignore `!build/` re-includes over the heuristic
 	await run_scenario(
