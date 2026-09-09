@@ -26,6 +26,9 @@ interface World {
 	read_gate?: Promise<void>;
 	// when set, the mock's `findFiles` rejects — simulating a web-host virtual-FS error
 	find_files_throws?: boolean;
+	// further workspace folders nested under the main one (a monorepo workspace with the
+	// repo root and a package folder both open)
+	nested_folders?: string[];
 }
 
 /** A file spec value for a file that is present but cannot be read. */
@@ -429,12 +432,19 @@ const main = async (): Promise<void> => {
 		]
 	);
 
-	// 7. safety nets: node_modules always skipped (repo)
+	// 7. safety nets: node_modules always skipped (repo). Ignore files UNDER a safety
+	//    net are never read by the CLI (it never descends), so they earn no hint here
+	//    either — the listing drops them (it is unexcluded, so `files.exclude` can't
+	//    hide an ignore file the CLI reads; the safety nets are filtered by hand)
 	await run_scenario(
 		'safety nets: node_modules skipped',
 		{
 			'.gitignore': '# nothing\n',
 			'node_modules/pkg/index.ts': UNFORMATTED_TS,
+			'node_modules/pkg/.formatignore': UNREADABLE,
+			'node_modules/pkg/.prettierignore': 'x\n',
+			'.hg/.formatignore': 'x\n',
+			'.hg/.prettierignore': 'x\n',
 			'src/app.css': UNFORMATTED_CSS
 		},
 		true,
@@ -443,6 +453,7 @@ const main = async (): Promise<void> => {
 			['src/app.css', 'css', false]
 		]
 	);
+	expect_hints('hint: none for ignore files under a safety net', []);
 
 	// 8. file under a gitignored directory is skipped (ancestor prune); svelte dispatch
 	await run_scenario(
@@ -723,6 +734,135 @@ const main = async (): Promise<void> => {
 			expect('re-add race: the stale first load was discarded', is_ignored('b.ts') && !is_ignored('a.ts'));
 		}
 	);
+
+
+	// 16. a `.git` FILE (a worktree's or submodule's) counts as in-repo, as on both CLIs
+	await run_scenario(
+		'.git file counts as in-repo',
+		{
+			'.git': 'gitdir: ../.git/worktrees/x\n',
+			'.gitignore': 'dist/\n',
+			'dist/out.ts': UNFORMATTED_TS,
+			'build/b.ts': UNFORMATTED_TS
+		},
+		false, // no `.git` DIRECTORY — the file alone decides
+		[
+			['dist/out.ts', 'typescript', true], // .gitignore honored
+			['build/b.ts', 'typescript', false] // heuristic off: a .gitignore is in scope
+		]
+	);
+
+	// 17. a folder removed while its reload is in flight: the stale reload must not
+	//     resurrect the dropped state. Unobservable while the folder is gone (no document
+	//     resolves to it), so the probe re-adds it with its fresh load held: until that
+	//     lands, nothing must be ignored — a resurrected snapshot would answer instead
+	await run_scenario(
+		'removed mid-reload: the stale reload does not resurrect the state',
+		{
+			'.formatignore': 'a.ts\n',
+			'a.ts': UNFORMATTED_TS
+		},
+		true,
+		[['a.ts', 'typescript', true]],
+		false,
+		async (world) => {
+			let release_stale = (): void => {};
+			world.read_gate = new Promise<void>((resolve) => {
+				release_stale = resolve;
+			});
+			fire_watcher('change', '.formatignore'); // holds at the gate
+			await settle();
+			fire_workspace_folders_changed('removed');
+			expect('removed mid-reload: nothing ignored', !is_ignored('a.ts'));
+			expect('removed mid-reload: no .git watcher', same_lines(watcher_patterns(), [IGNORE_GLOB]));
+			release_stale();
+			await settle(); // the stale reload finishes — and must drop its result
+			let release_fresh = (): void => {};
+			world.read_gate = new Promise<void>((resolve) => {
+				release_fresh = resolve;
+			});
+			fire_workspace_folders_changed('added'); // the fresh load, held
+			await settle();
+			expect('re-added: no resurrected state before the fresh load lands', !is_ignored('a.ts'));
+			release_fresh();
+			await settle();
+			expect('re-added: the fresh load landed', is_ignored('a.ts'));
+		}
+	);
+
+	// 18. an ignore-file event DURING the initial load: the first-started reload is
+	//     superseded and drops its result, so activation must wait for the newer one —
+	//     it resolves with the folder's state cached, never with nothing
+	{
+		const world = build_world({ '.formatignore': 'a.ts\n', 'a.ts': UNFORMATTED_TS }, true);
+		set_world(world);
+		let release_initial = (): void => {};
+		world.read_gate = new Promise<void>((resolve) => {
+			release_initial = resolve;
+		});
+		const ctx = make_context();
+		const activation = activate_formatter(ctx as never, formatters, IgnoreStack as never);
+		await settle(); // the initial load holds at the gate
+		let release_newer = (): void => {};
+		world.read_gate = new Promise<void>((resolve) => {
+			release_newer = resolve;
+		});
+		fire_watcher('change', '.formatignore'); // a newer reload, held at its own gate
+		await settle();
+		release_initial();
+		await settle();
+		let activated = false;
+		void activation.then(() => {
+			activated = true;
+		});
+		await settle();
+		expect('mid-load event: activation waits for the newer reload', !activated);
+		release_newer();
+		await activation;
+		expect('mid-load event: activation resolved with the state cached', is_ignored('a.ts'));
+		deactivate_formatter();
+		for (const subscription of ctx.subscriptions) subscription.dispose();
+		expect('mid-load event: no watcher outlives deactivation', watcher_patterns().length === 0);
+	}
+
+	// 19. a nested workspace folder (the repo root AND a package folder both open): the
+	//     OUTERMOST folder is the eval root, as `tsv format` run from the repo root — so
+	//     the root .gitignore and a hierarchical .prettierignore reach the package's
+	//     documents (VS Code's own lookup answers the innermost folder, which has no
+	//     .git and would fall to the loose regime). The nested folder gets no state of
+	//     its own: no .git watcher, no outside-repo hint for a .prettierignore the root reads
+	{
+		const world = build_world(
+			{
+				'.gitignore': '*.gen.ts\n',
+				'packages/a/.prettierignore': 'p.ts\n',
+				'packages/a/foo.gen.ts': UNFORMATTED_TS,
+				'packages/a/p.ts': UNFORMATTED_TS,
+				'packages/a/keep.ts': UNFORMATTED_TS
+			},
+			true
+		);
+		world.nested_folders = [`${FOLDER}/packages/a`];
+		set_world(world);
+		const ctx = make_context();
+		await activate_formatter(ctx as never, formatters, IgnoreStack as never);
+		expect('nested folder: root .gitignore reaches it', is_ignored('packages/a/foo.gen.ts'));
+		expect('nested folder: its .prettierignore is read via the root', is_ignored('packages/a/p.ts'));
+		expect('nested folder: plain source formats', !is_ignored('packages/a/keep.ts'));
+		expect_hints('hint: none — the nested .prettierignore is read, not outside a repo', []);
+		expect(
+			'nested folder: one .git watcher, for the root only',
+			same_lines(watcher_patterns().sort(), [IGNORE_GLOB, GIT_PATTERN].sort())
+		);
+		// an event under the nested folder reloads the ROOT (whose state governs it)
+		world.files.set(`${FOLDER}/packages/a/.formatignore`, 'keep.ts\n');
+		fire_watcher('change', 'packages/a/.formatignore');
+		await settle();
+		expect('nested folder: an event there reloads the root', is_ignored('packages/a/keep.ts'));
+		deactivate_formatter();
+		for (const subscription of ctx.subscriptions) subscription.dispose();
+		expect('nested folder: no watcher outlives deactivation', watcher_patterns().length === 0);
+	}
 
 	console.log(`${pass} passed, ${fail} failed`);
 	if (fail > 0) process.exit(1);

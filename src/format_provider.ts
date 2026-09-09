@@ -100,6 +100,11 @@ let status_item: vscode.StatusBarItem | undefined;
 const gitignore_file_name = '.gitignore';
 const formatignore_file_name = '.formatignore';
 const prettierignore_file_name = '.prettierignore';
+const ignore_file_names = [gitignore_file_name, formatignore_file_name, prettierignore_file_name];
+// the directories tsv's discovery never descends into, whatever the ignore files say
+// (`tsv_discover::SAFETY_NET_DIRS`) — an ignore file under one is never read by the
+// CLI, so the listing drops them (see `scan_ignore_files`)
+const safety_net_dirs = new Set(['node_modules', '.git', '.sl', '.hg', '.svn', '.jj']);
 
 // The cached ignore state for one workspace folder, rebuilt off the save path.
 interface FolderIgnore {
@@ -142,6 +147,10 @@ const folder_ignores = new Map<string, FolderIgnore>();
 // re-added while its reload is in flight gets a number that reload cannot match.
 const folder_generations = new Map<string, number>();
 let reload_generation = 0;
+// per folder, the reload most recently started and not yet landed — what the initial
+// load awaits (see `ignore_folder_settled`), so activation resolves with the LATEST
+// snapshot cached, not merely after the first-started reload finished
+const folder_reloads = new Map<string, Promise<void>>();
 // per folder, the `.git` watcher that flips its regime (see `watch_folder_git`)
 const git_watchers = new Map<string, vscode.Disposable>();
 // strict, like both CLIs: an ignore file that is not valid UTF-8 is unreadable
@@ -175,6 +184,46 @@ const ancestor_dirs = (rel: string): string[] => {
 		dirs.push(acc);
 	}
 	return dirs;
+};
+
+/** Whether `dir_rel` (a folder-relative directory, `''` = the root) lies under a
+ * safety-net directory — where the CLI's walk never goes. */
+const is_under_safety_net = (dir_rel: string): boolean =>
+	dir_rel !== '' && dir_rel.split('/').some((segment) => safety_net_dirs.has(segment));
+
+/** Whether workspace folder `outer` contains `inner` (or is it). */
+const folder_contains = (outer: vscode.WorkspaceFolder, inner: vscode.WorkspaceFolder): boolean =>
+	outer.uri.scheme === inner.uri.scheme &&
+	outer.uri.authority === inner.uri.authority &&
+	(inner.uri.path === outer.uri.path ||
+		inner.uri.path.startsWith(
+			outer.uri.path.endsWith('/') ? outer.uri.path : `${outer.uri.path}/`
+		));
+
+/**
+ * The workspace folders that are eval roots: every open folder not nested inside
+ * another open folder. A nested folder (a monorepo workspace with the repo root and a
+ * package folder both open) is covered by its ancestor, whose ignore files reach it
+ * hierarchically — as they do for the CLI run from that ancestor — so it gets no state
+ * of its own: it would evaluate its documents in the loose regime (no `.git` of its
+ * own) and log an outside-repo hint for a `.prettierignore` the ancestor reads.
+ */
+const root_folders = (): vscode.WorkspaceFolder[] => {
+	const folders = vscode.workspace.workspaceFolders ?? [];
+	return folders.filter(
+		(folder) => !folders.some((other) => other !== folder && folder_contains(other, folder))
+	);
+};
+
+/** The eval root for `uri`: the OUTERMOST open workspace folder containing it (VS
+ * Code's `getWorkspaceFolder` answers the innermost), or `undefined` outside them all. */
+const root_folder_for = (uri: vscode.Uri): vscode.WorkspaceFolder | undefined => {
+	let root = vscode.workspace.getWorkspaceFolder(uri);
+	if (!root) return undefined;
+	for (const folder of vscode.workspace.workspaceFolders ?? []) {
+		if (folder !== root && folder_contains(folder, root)) root = folder;
+	}
+	return root;
 };
 
 /** Whether the workspace folder is a git repo (a `<folder>/.git` dir *or* file),
@@ -243,49 +292,54 @@ const read_ignore_file = async (uri: vscode.Uri): Promise<IgnoreRead> => {
 const unreadable_warning = (display_path: string, reason: string): string =>
 	`could not read ${display_path} (${reason}); its ignore rules are not applied`;
 
-/** Every PRESENT ignore file of one name under `folder` (excluding node_modules),
- * keyed by the directory holding it — its text, or `unreadable` with the reason (an
- * absent read, the file deleted between the listing and the read, is dropped).
- * `findFiles`' `**​/` prefix can miss the folder-root file, so the caller reads that
- * one explicitly. Never rejects: a `findFiles` failure is logged and yields an empty
- * map, so the caller still degrades to the folder-root file plus structural pruning
- * instead of aborting activation. */
-const find_ignore_files = async (
-	folder: vscode.WorkspaceFolder,
-	name: string
-): Promise<Map<string, IgnoreRead>> => {
+/**
+ * One listing of every ignore file under `folder`, keyed by file name. The exclude is
+ * `null` deliberately: VS Code applies the `files.exclude` setting on top of any exclude
+ * glob and disregards it only for `null`, so a user's `**​/dist` there would hide an
+ * ignore file the CLI reads (`search.exclude` never applies to `findFiles`, and
+ * `.gitignore` is not consulted). The safety-net directories are dropped from the
+ * listing here instead of by an exclude glob — the walk never descends into them, so an
+ * ignore file under one is never read by the CLI either. One scan for the three names,
+ * so the unexcluded walk (`node_modules` included) is paid once per reload.
+ * Never rejects: a `findFiles` failure is logged and yields empty listings, so the
+ * caller still degrades to the folder-root files plus structural pruning instead of
+ * aborting activation.
+ */
+const scan_ignore_files = async (
+	folder: vscode.WorkspaceFolder
+): Promise<Map<string, vscode.Uri[]>> => {
 	const root = folder.uri.path;
-	const out = new Map<string, IgnoreRead>();
+	const out = new Map<string, vscode.Uri[]>(ignore_file_names.map((name) => [name, []]));
 	let found: vscode.Uri[];
 	try {
 		found = await vscode.workspace.findFiles(
-			new vscode.RelativePattern(folder, `**/${name}`),
-			'**/node_modules/**'
+			new vscode.RelativePattern(folder, `**/.{gitignore,prettierignore,formatignore}`),
+			null
 		);
 	} catch (err) {
 		// a `findFiles` rejection (likeliest on the web host's virtual FS) must not
 		// abort activation or leak an unhandled rejection from a watcher reload — keep
 		// `reload_ignore_folder` non-throwing. The caller still reads the folder-root
-		// file directly and installs a state object, so this degrades to "root ignore
+		// files directly and installs a state object, so this degrades to "root ignore
 		// files only" plus the always-on safety-net / build-output pruning, never to
 		// "format everything"
-		log_line(`could not scan for ${name} under ${folder.name}: ${to_error_message(err)}`);
+		log_line(`could not scan for ignore files under ${folder.name}: ${to_error_message(err)}`);
 		return out;
 	}
-	// read concurrently — off the save path, but the reload's length is the window
-	// in which a save still sees the previous state
-	const reads = await Promise.all(
-		found.map(async (uri) => [ignore_dir_rel(root, uri.path), await read_ignore_file(uri)] as const)
-	);
-	for (const [dir, read] of reads) {
-		if (read.kind !== 'absent') out.set(dir, read);
+	for (const uri of found) {
+		const rel = folder_rel(root, uri.path);
+		const slash = rel.lastIndexOf('/');
+		if (is_under_safety_net(slash === -1 ? '' : rel.slice(0, slash))) continue;
+		out.get(rel.slice(slash + 1))?.push(uri);
 	}
 	return out;
 };
 
 /**
- * Every present ignore file of one name under `folder`: `find_ignore_files` plus
- * the explicit folder-root read `**​/` can miss (inside a repo the root `.gitignore`
+ * Every present ignore file of one name under `folder`, keyed by the directory holding
+ * it — its text, or `unreadable` with the reason (an absent read, the file deleted
+ * between the listing and the read, is dropped): the `listed` URIs read concurrently,
+ * plus the explicit folder-root read `**​/` can miss (inside a repo the root `.gitignore`
  * / `.prettierignore`, both regimes the root `.formatignore`). The root file is
  * usually NOT there, so its presence is a stat, never a read whose failure is
  * then classified: a provider that reports a missing file with a bare error (no
@@ -296,9 +350,21 @@ const find_ignore_files = async (
  */
 const collect_ignore_files = async (
 	folder: vscode.WorkspaceFolder,
-	name: string
+	name: string,
+	listed: vscode.Uri[]
 ): Promise<Map<string, IgnoreRead>> => {
-	const files = await find_ignore_files(folder, name);
+	const root = folder.uri.path;
+	const files = new Map<string, IgnoreRead>();
+	// read concurrently — off the save path, but the reload's length is the window
+	// in which a save still sees the previous state
+	const reads = await Promise.all(
+		listed.map(
+			async (uri) => [ignore_dir_rel(root, uri.path), await read_ignore_file(uri)] as const
+		)
+	);
+	for (const [dir, read] of reads) {
+		if (read.kind !== 'absent') files.set(dir, read);
+	}
 	if (!files.has('')) {
 		const root_uri = vscode.Uri.joinPath(folder.uri, name);
 		if (await path_exists(root_uri)) {
@@ -341,27 +407,61 @@ const ignore_texts = (
  * `.formatignore` hierarchy (both regimes), and — only inside a repo — the
  * `.gitignore` hierarchy plus the `.prettierignore` hierarchy (each shadowed
  * per-directory by a sibling `.formatignore`). The workspace folder is the eval
- * root. Async (reads files); never on the save path.
+ * root. Async (reads files); never on the save path. Tracked in `folder_reloads`
+ * while in flight so `ignore_folder_settled` can wait for the latest one.
  *
  * @mutates folder_ignores
  */
-const reload_ignore_folder = async (folder: vscode.WorkspaceFolder): Promise<void> => {
+const reload_ignore_folder = (folder: vscode.WorkspaceFolder): Promise<void> => {
 	const IgnoreStack = ignore_stack_ctor;
-	if (!IgnoreStack) return;
+	if (!IgnoreStack) return Promise.resolve();
+	const key = folder.uri.toString();
+	const reload: Promise<void> = run_ignore_reload(folder, IgnoreStack).finally(() => {
+		if (folder_reloads.get(key) === reload) folder_reloads.delete(key);
+	});
+	folder_reloads.set(key, reload);
+	return reload;
+};
+
+/**
+ * Resolves once no reload is in flight for `folder` — after the LATEST-started one has
+ * landed (or the folder was dropped). A reload superseded mid-read discards its result
+ * at the generation guard, so awaiting only the first-started one would let activation
+ * resolve with nothing cached when an ignore file is written during the initial load.
+ */
+const ignore_folder_settled = async (folder: vscode.WorkspaceFolder): Promise<void> => {
+	const key = folder.uri.toString();
+	let pending: Promise<void> | undefined;
+	while ((pending = folder_reloads.get(key)) !== undefined) await pending;
+};
+
+const run_ignore_reload = async (
+	folder: vscode.WorkspaceFolder,
+	IgnoreStack: IgnoreStackCtor
+): Promise<void> => {
 	const key = folder.uri.toString();
 	const generation = ++reload_generation;
 	folder_generations.set(key, generation);
 
-	const in_repo = await folder_is_repo(folder);
+	const [in_repo, listed] = await Promise.all([folder_is_repo(folder), scan_ignore_files(folder)]);
 	const none = new Map<string, IgnoreRead>();
+	const listed_for = (name: string): vscode.Uri[] => listed.get(name) ?? [];
 	// every read at once (off the save path, but shorter is a shorter stale window);
 	// `.gitignore` and `.prettierignore` are read inside a repo only — outside one the
 	// folder-root `.prettierignore`'s PRESENCE is still asked, for the hint
 	const [formatignore_reads, gitignore_reads, prettierignore_reads, root_prettierignore_present] =
 		await Promise.all([
-			collect_ignore_files(folder, formatignore_file_name),
-			in_repo ? collect_ignore_files(folder, gitignore_file_name) : none,
-			in_repo ? collect_ignore_files(folder, prettierignore_file_name) : none,
+			collect_ignore_files(folder, formatignore_file_name, listed_for(formatignore_file_name)),
+			in_repo
+				? collect_ignore_files(folder, gitignore_file_name, listed_for(gitignore_file_name))
+				: none,
+			in_repo
+				? collect_ignore_files(
+						folder,
+						prettierignore_file_name,
+						listed_for(prettierignore_file_name)
+					)
+				: none,
 			in_repo ? false : path_exists(vscode.Uri.joinPath(folder.uri, prettierignore_file_name))
 		]);
 	// a newer reload started while this one was reading: its reads are the later
@@ -483,11 +583,11 @@ const ignore_hints = (
 	return hints.sort();
 };
 
-const clear_ignore_folder = (folder: vscode.WorkspaceFolder): void => {
-	const key = folder.uri.toString();
+const clear_ignore_folder = (key: string): void => {
 	folder_ignores.delete(key);
-	// a reload still in flight for the removed folder must not resurrect its state
+	// a reload still in flight for the dropped folder must not resurrect its state
 	folder_generations.delete(key);
+	folder_reloads.delete(key);
 	git_watchers.get(key)?.dispose();
 	git_watchers.delete(key);
 };
@@ -495,8 +595,36 @@ const clear_ignore_folder = (folder: vscode.WorkspaceFolder): void => {
 const clear_ignore_folders = (): void => {
 	folder_ignores.clear();
 	folder_generations.clear();
+	folder_reloads.clear();
 	for (const watcher of git_watchers.values()) watcher.dispose();
 	git_watchers.clear();
+};
+
+/**
+ * Brings the tracked folders in line with the current eval roots (`root_folders`):
+ * a folder that is no longer a root — removed, or now nested inside a newly added
+ * ancestor — drops its state, in-flight reload and `.git` watcher; a root not yet
+ * tracked gets its watcher and a reload. The `.git` watcher's presence is the
+ * "tracked" mark, since a root always has one.
+ *
+ * @mutates folder_ignores, git_watchers
+ */
+const sync_ignore_folders = (): void => {
+	const roots = root_folders();
+	const root_keys = new Set(roots.map((folder) => folder.uri.toString()));
+	const tracked = new Set([
+		...folder_ignores.keys(),
+		...folder_reloads.keys(),
+		...git_watchers.keys()
+	]);
+	for (const key of tracked) {
+		if (!root_keys.has(key)) clear_ignore_folder(key);
+	}
+	for (const folder of roots) {
+		if (git_watchers.has(folder.uri.toString())) continue;
+		watch_folder_git(folder);
+		void reload_ignore_folder(folder);
+	}
 };
 
 /**
@@ -544,7 +672,7 @@ const tsv_layer_for_dir = (state: FolderIgnore, dir: string): string | undefined
  */
 const is_document_ignored = (document: vscode.TextDocument): boolean => {
 	if (!ignore_stack_ctor) return false;
-	const folder = vscode.workspace.getWorkspaceFolder(document.uri);
+	const folder = root_folder_for(document.uri);
 	if (!folder) return false;
 	const state = folder_ignores.get(folder.uri.toString());
 	if (!state) return false;
@@ -591,50 +719,44 @@ const activate_ignore = async (
 	IgnoreStack: IgnoreStackCtor
 ): Promise<void> => {
 	ignore_stack_ctor = IgnoreStack;
-	const folders = vscode.workspace.workspaceFolders ?? [];
-	// the watchers go in BEFORE the initial load, so an ignore file or `.git` written
-	// during that load is not missed until the next event — a reload they fire
-	// meanwhile is just a newer generation, and the guard lets it win
-	for (const folder of folders) watch_folder_git(folder);
 	// one watcher covers .gitignore + the tsv files in every folder; any change
-	// re-reads that folder's whole state off the save path (works in both hosts)
+	// re-reads that folder's whole state off the save path (works in both hosts).
+	// The watchers go in BEFORE the initial load, so an ignore file or `.git` written
+	// during that load is not missed until the next event — a reload they fire
+	// meanwhile is just a newer generation, and the initial load waits for it
 	const watcher = vscode.workspace.createFileSystemWatcher(
 		'**/.{gitignore,prettierignore,formatignore}'
 	);
 	const on_change = (uri: vscode.Uri): void => {
-		// `findFiles` never looks inside node_modules, so an ignore file there can't
+		// the listing drops ignore files under the safety nets, so one there can't
 		// change the state — skip the reload rather than re-scan the folder per
 		// package during an install (VS Code's default `files.watcherExclude` covers
 		// node_modules, but that is the user's setting to clear)
-		if (uri.path.includes('/node_modules/')) return;
-		const folder = vscode.workspace.getWorkspaceFolder(uri);
-		if (folder) void reload_ignore_folder(folder);
+		const folder = root_folder_for(uri);
+		if (!folder) return;
+		if (is_under_safety_net(ignore_dir_rel(folder.uri.path, uri.path))) return;
+		void reload_ignore_folder(folder);
 	};
 	context.subscriptions.push(
 		watcher,
 		watcher.onDidCreate(on_change),
 		watcher.onDidChange(on_change),
 		watcher.onDidDelete(on_change),
-		vscode.workspace.onDidChangeWorkspaceFolders((event) => {
-			// an added folder's load is not awaited (the event handler can't hold
-			// VS Code), so a document in it saved before the load lands formats
-			// once un-ignored — the window activation closes for the initial
-			// folders, left open here: a folder is added by a user gesture, and a
-			// skipped format would be the worse silent outcome
-			for (const folder of event.added) {
-				void reload_ignore_folder(folder);
-				watch_folder_git(folder);
-			}
-			for (const folder of event.removed) clear_ignore_folder(folder);
-		}),
+		// an added folder's load is not awaited (the event handler can't hold
+		// VS Code), so a document in it saved before the load lands formats
+		// once un-ignored — the window activation closes for the initial
+		// folders, left open here: a folder is added by a user gesture, and a
+		// skipped format would be the worse silent outcome
+		vscode.workspace.onDidChangeWorkspaceFolders(sync_ignore_folders),
 		// the per-folder `.git` watchers, disposed with the extension
 		{ dispose: clear_ignore_folders }
 	);
+	sync_ignore_folders();
 
 	// await the initial load so the cache is populated before the provider can run:
 	// activation finishes before VSCode invokes a formatter, so this closes the
 	// startup window where an ignored file could format once before its cache landed
-	await Promise.all(folders.map(reload_ignore_folder));
+	await Promise.all(root_folders().map(ignore_folder_settled));
 };
 
 const to_error_message = (value: unknown): string =>

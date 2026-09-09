@@ -64,7 +64,13 @@ exists" — re-evaluated on every reload, and a per-folder watcher on that one
 vanishes, so `git init` in an open loose folder flips the regime at once rather
 than at the next ignore-file save. A subdir-opened repo therefore falls back to the loose regime
 (`.formatignore` + heuristic, no `.gitignore`) — the conservative side (it skips
-more, never formats build output the CLI would skip).
+more, never formats build output the CLI would skip). In a multi-root workspace the
+eval root is the **outermost** open folder containing the document: a package
+folder opened beside its repo root (VS Code's own lookup answers the innermost)
+is covered by the root, whose ignore files reach it hierarchically as they do for
+the CLI run from there, so a nested folder gets no state, watcher or hint of its
+own — only folders not nested inside another open folder are tracked, re-derived
+on every workspace-folder change.
 
 To match "skip exactly what `tsv format` skips," the extension defers the **whole**
 directory-prune decision — both the per-file ancestor *walk* and the prune *verdict*
@@ -100,13 +106,21 @@ pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the r
   status-bar + `tsv` Output channel for parse failures and the `.prettierignore`
   heads-ups, and the gitignore-aware skip logic. Per workspace folder it caches `{in_repo, gitignores, formatignores,
   prettierignores}` — the `.gitignore` / `.formatignore` / `.prettierignore` texts
-  keyed by directory (found via `findFiles`, plus an explicit folder-root read
-  since `**/` misses depth 0; `.prettierignore` hierarchically inside a repo, each
-  shadowed per-directory by a sibling `.formatignore`), the `.git` regime flag and
-  the hint set — prebuilt off the save path and refreshed via a `FileSystemWatcher`
-  over `**/.{gitignore,prettierignore,formatignore}` (events under `node_modules`
-  are skipped — `findFiles` never looks there, so they can't change the state) plus
-  the per-folder `.git` watcher, both installed before the initial load so nothing
+  keyed by directory (one `findFiles` listing for the three names, plus an
+  explicit folder-root read as a backstop for a listing that misses depth 0;
+  `.prettierignore` hierarchically inside a repo, each shadowed per-directory by a
+  sibling `.formatignore`), the `.git` regime flag and the hint set. The listing's
+  exclude is `null` on purpose: `findFiles` applies the user's `files.exclude` on
+  top of any exclude glob and disregards it only for `null` (`search.exclude` never
+  applies, `.gitignore` is not consulted), and a `**/dist` there would hide an
+  ignore file the CLI reads. The safety-net directories are dropped from the
+  listing by hand instead — the walk never descends into them, so an ignore file
+  under one is never read by the CLI either — at the price of one unexcluded walk
+  (`node_modules` included) per reload. The state is prebuilt off the save path
+  and refreshed via a `FileSystemWatcher` over
+  `**/.{gitignore,prettierignore,formatignore}` (events under a safety net are
+  skipped — the listing drops them, so they can't change the state) plus the
+  per-folder `.git` watcher, both installed before the initial load so nothing
   written during it is missed. A reload reads every ignore file concurrently; the
   folder-root files `**/` misses are stat-ed before they are read, so an absent one
   is silent whatever error shape a virtual-FS provider uses for a missing file
@@ -119,7 +133,11 @@ pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the r
   per-document `IgnoreStack` from that cache (synchronously), runs `is_ignored` +
   `is_path_pruned`, and frees it, so the provider stays synchronous. Activation
   **awaits** that initial load before registering the provider, closing the
-  startup window where a save could beat the cache; a `findFiles` rejection there
+  startup window where a save could beat the cache — and waits for the
+  folder's *latest* reload, not merely the first-started one: an ignore file
+  written during the load fires a newer reload that supersedes the initial
+  one, whose result is then dropped at the generation guard, so awaiting only
+  it would resolve with nothing cached; a `findFiles` rejection there
   (likeliest on the web host's virtual FS) is caught and logged, degrading to the
   folder-root ignore files plus the always-on safety-net/heuristic pruning — never
   aborting activation or formatting everything. A folder added later is loaded

@@ -1,8 +1,8 @@
 // Minimal mock of the `vscode` module for the smoke test (test/smoke.ts). Backed
-// by an in-memory "world" (files + dirs under one workspace folder) set per
-// scenario. findFiles deliberately mirrors VSCode's `**/` glob, which MISSES the
-// folder-root file — so the provider's explicit-root-read fallback is exercised
-// (the absence of which was a real bug this test caught).
+// by an in-memory "world" (files + dirs under one workspace folder, optionally
+// with nested workspace folders) set per scenario. findFiles deliberately omits
+// the folder-root file from its listing — so the provider's explicit-root-read
+// backstop is exercised (the absence of which was a real bug this test caught).
 'use strict';
 
 let world = { folder_path: '/repo', files: new Map(), dirs: new Set() };
@@ -60,29 +60,53 @@ const not_found = (uri) =>
 		? new Error(`no such file: ${uri.path}`)
 		: Object.assign(new Error(`ENOENT ${uri.path}`), { code: 'FileNotFound' });
 
-const folders = () => [{ uri: Uri.file(world.folder_path), name: 'repo', index: 0 }];
+// the workspace folders: the main one (absent after `__fire_workspace_folders_changed('removed')`,
+// as the real `workspaceFolders` is updated before the event fires) plus any nested
+// folders the world declares (`nested_folders`, paths under the main one — a monorepo
+// workspace with the repo root and a package folder both open)
+const folders = () => {
+	const out = main_folder_removed
+		? []
+		: [{ uri: Uri.file(world.folder_path), name: 'repo', index: 0 }];
+	for (const p of world.nested_folders ?? []) {
+		out.push({ uri: Uri.file(p), name: p.slice(p.lastIndexOf('/') + 1), index: out.length });
+	}
+	return out;
+};
+let main_folder_removed = false;
 
 const workspace = {
 	get workspaceFolders() {
 		return folders();
 	},
+	// the INNERMOST folder containing `uri`, as VS Code's longest-prefix lookup answers
 	getWorkspaceFolder(uri) {
-		const f = folders()[0];
-		return uri.path === f.uri.path || uri.path.startsWith(`${f.uri.path}/`) ? f : undefined;
+		let found;
+		for (const f of folders()) {
+			if (uri.path !== f.uri.path && !uri.path.startsWith(`${f.uri.path}/`)) continue;
+			if (!found || f.uri.path.length > found.uri.path.length) found = f;
+		}
+		return found;
 	},
-	async findFiles(relPattern, _exclude) {
+	// the extension passes `null` as the exclude — the one value that disregards the
+	// user's `files.exclude` (a string exclude leaves it in force) — and drops the
+	// safety-net directories itself, so the listing here holds everything, node_modules
+	// included, and a non-null exclude is a mock error rather than silently modeled
+	async findFiles(relPattern, exclude) {
+		if (exclude !== null) throw new Error(`mock: findFiles expects a null exclude, got ${exclude}`);
 		// opt-in failure injection: exercises the web-host virtual-FS rejection path
 		if (world.find_files_throws) throw new Error('findFiles failed (mock)');
-		const name = relPattern.pattern.replace(/^\*\*\//, '');
+		const m = /^\*\*\/\.\{([^}]*)\}$/.exec(relPattern.pattern);
+		if (!m) throw new Error(`mock: unsupported findFiles glob ${relPattern.pattern}`);
+		const names = new Set(m[1].split(',').map((n) => `.${n}`));
 		const root = relPattern.folder.uri.path;
 		const out = [];
 		for (const p of world.files.keys()) {
 			if (!p.startsWith(`${root}/`)) continue;
 			const rel = p.slice(root.length + 1);
-			if (rel.includes('node_modules/')) continue;
 			// `**/` requires at least one dir segment — root-level files are missed
 			if (!rel.includes('/')) continue;
-			if (rel.slice(rel.lastIndexOf('/') + 1) === name) out.push(Uri.file(p));
+			if (names.has(rel.slice(rel.lastIndexOf('/') + 1))) out.push(Uri.file(p));
 		}
 		return out;
 	},
@@ -231,6 +255,7 @@ module.exports = {
 		output_lines = [];
 		watchers = [];
 		workspace_folders_listener = undefined;
+		main_folder_removed = false;
 	},
 	__get_output_lines() {
 		return output_lines;
@@ -248,9 +273,11 @@ module.exports = {
 	__watcher_patterns() {
 		return watchers.map((w) => (typeof w.pattern === 'string' ? w.pattern : `<folder>/${w.pattern.pattern}`));
 	},
-	/** Fire the workspace-folders listener with the one mock folder added/removed. */
+	/** Remove / re-add the main mock folder: `workspaceFolders` reflects it first, then
+	 * the workspace-folders listener fires, as in VS Code. */
 	__fire_workspace_folders_changed(kind) {
-		const folder = folders()[0];
+		const folder = { uri: Uri.file(world.folder_path), name: 'repo', index: 0 };
+		main_folder_removed = kind === 'removed';
 		workspace_folders_listener?.({ added: kind === 'added' ? [folder] : [], removed: kind === 'removed' ? [folder] : [] });
 	},
 	__get_provider() {
