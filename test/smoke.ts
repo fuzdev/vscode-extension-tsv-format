@@ -98,7 +98,8 @@ const outside_repo_hint = (dir: string): string =>
 /** The CLI's line for a present-but-unreadable ignore file (`cli.js` `read_ignore_file`). */
 const unreadable_hint = (display_path: string, reason: string): string =>
 	`could not read ${display_path} (${reason}); its ignore rules are not applied`;
-const PERMISSION_REASON = (rel: string): string => `EACCES: permission denied, open '${FOLDER}/${rel}'`;
+const permission_reason = (rel: string): string =>
+	`EACCES: permission denied, open '${FOLDER}/${rel}'`;
 /** The Output lines are `[<iso timestamp>] <hint>`; compare on the hint alone. */
 const hint_lines = (): string[] => output_lines().map((line) => line.replace(/^\[[^\]]*\] /, ''));
 const expect_hints = (label: string, expected: string[]): void =>
@@ -502,9 +503,9 @@ const main = async (): Promise<void> => {
 	expect_hints(
 		'hint: every unreadable file warned once, presence-keyed shadows, no read of a shadowed one',
 		[
-			unreadable_hint('repo/.formatignore', PERMISSION_REASON('.formatignore')),
-			unreadable_hint('repo/.gitignore', PERMISSION_REASON('.gitignore')),
-			unreadable_hint('repo/b/.prettierignore', PERMISSION_REASON('b/.prettierignore')),
+			unreadable_hint('repo/.formatignore', permission_reason('.formatignore')),
+			unreadable_hint('repo/.gitignore', permission_reason('.gitignore')),
+			unreadable_hint('repo/b/.prettierignore', permission_reason('b/.prettierignore')),
 			unreadable_hint('repo/sub/.formatignore', 'invalid UTF-8'),
 			shadow_hint('repo'),
 			shadow_hint('repo/c'),
@@ -526,7 +527,7 @@ const main = async (): Promise<void> => {
 		[['keep.ts', 'typescript', false]]
 	);
 	expect_hints('hint: the unreadable .formatignore alone', [
-		unreadable_hint('repo/.formatignore', PERMISSION_REASON('.formatignore'))
+		unreadable_hint('repo/.formatignore', permission_reason('.formatignore'))
 	]);
 
 	console.log(`${pass} passed, ${fail} failed`);

@@ -120,9 +120,10 @@ interface FolderIgnore {
 	// `.formatignore`'s PRESENCE, not its readability, so a read error can't silently
 	// demote tsv's native file to prettier's. Empty outside a repo.
 	prettierignores: Map<string, string>;
-	// the `.prettierignore` heads-ups this state carries (see `ignore_hints`), kept so
-	// a reload that changes nothing re-logs nothing — the watcher fires on every
-	// ignore-file save, and the same unread file is one line, not one per save
+	// the heads-ups this state carries — the unreadable-file warnings and the two
+	// `.prettierignore` hints (see `ignore_hints`) — kept so a reload that changes
+	// nothing re-logs nothing: the watcher fires on every ignore-file save, and the
+	// same unread file is one line, not one per save
 	hints: string[];
 }
 
@@ -166,13 +167,22 @@ const ancestor_dirs = (rel: string): string[] => {
  * mirroring the CLI's `find_repo_root` — except the extension only checks the
  * folder itself, never walking up to a repo root above it (those ignore files
  * are out of scope and unwatchable from within the folder). Async (stats disk). */
-const folder_is_repo = async (folder: vscode.WorkspaceFolder): Promise<boolean> => {
+const folder_is_repo = (folder: vscode.WorkspaceFolder): Promise<boolean> =>
+	path_exists(vscode.Uri.joinPath(folder.uri, '.git'));
+
+/** Whether anything exists at `uri` — presence, the listing's question, not a read. */
+const path_exists = async (uri: vscode.Uri): Promise<boolean> => {
 	try {
-		await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, '.git'));
+		await vscode.workspace.fs.stat(uri);
 		return true;
 	} catch {
 		return false;
 	}
+};
+
+/** One timestamped line on the `tsv` Output channel (never revealed by this). */
+const log_line = (text: string): void => {
+	output_channel?.appendLine(`[${new Date().toISOString()}] ${text}`);
 };
 
 /**
@@ -245,9 +255,7 @@ const find_ignore_files = async (
 		// file directly and installs a state object, so this degrades to "root ignore
 		// files only" plus the always-on safety-net / build-output pruning, never to
 		// "format everything"
-		output_channel?.appendLine(
-			`[${new Date().toISOString()}] could not scan for ${name} under ${folder.name}: ${to_error_message(err)}`
-		);
+		log_line(`could not scan for ${name} under ${folder.name}: ${to_error_message(err)}`);
 		return out;
 	}
 	for (const uri of found) {
@@ -275,30 +283,30 @@ const collect_ignore_files = async (
 };
 
 /**
- * Split one name's reads into its texts (the layers to push) and, for every
- * unreadable one, the CLI's warning line — an unreadable file's rules are dropped,
- * never silently treated as absent (this is also a `--check` reproducibility hazard
- * on the CLI, and here the difference between what saves and what `tsv format`
- * would touch). The display path is folder-relative, like the other hints'.
+ * One name's reads as the texts to push (the layers), pushing the CLI's warning
+ * line onto `warnings` for every unreadable one — an unreadable file's rules are
+ * dropped, never silently treated as absent (on the CLI a `--check` reproducibility
+ * hazard; here the difference between what a save touches and what `tsv format`
+ * would). Presence is the reads map's own key set, so a caller that needs it (the
+ * shadow) reads the keys, not this. The display path is folder-relative, like the
+ * other hints'.
  */
-const split_ignore_reads = (
+const ignore_texts = (
 	folder: vscode.WorkspaceFolder,
 	name: string,
 	reads: Map<string, IgnoreRead>,
 	warnings: string[]
-): { texts: Map<string, string>; unreadable: Set<string> } => {
+): Map<string, string> => {
 	const texts = new Map<string, string>();
-	const unreadable = new Set<string>();
 	for (const [dir, read] of reads) {
 		if (read.kind === 'content') {
 			texts.set(dir, read.content);
 		} else if (read.kind === 'unreadable') {
-			unreadable.add(dir);
 			const display = dir === '' ? `${folder.name}/${name}` : `${folder.name}/${dir}/${name}`;
 			warnings.push(unreadable_warning(display, read.reason));
 		}
 	}
-	return { texts, unreadable };
+	return texts;
 };
 
 /**
@@ -317,58 +325,48 @@ const reload_ignore_folder = async (folder: vscode.WorkspaceFolder): Promise<voi
 	// gathered here and folded into the folder's hint set below
 	const warnings: string[] = [];
 	const formatignore_reads = await collect_ignore_files(folder, formatignore_file_name);
-	const { texts: formatignores, unreadable: formatignore_unreadable } = split_ignore_reads(
-		folder,
-		formatignore_file_name,
-		formatignore_reads,
-		warnings
-	);
+	// presence is the listing — an unreadable `.formatignore` is present, and it is
+	// presence that shadows a sibling `.prettierignore` (as on the CLI, so a read
+	// error can't silently demote tsv's native file to prettier's)
+	const formatignore_present = new Set(formatignore_reads.keys());
+	const formatignores = ignore_texts(folder, formatignore_file_name, formatignore_reads, warnings);
 
-	let gitignores = new Map<string, string>();
-	let prettierignores = new Map<string, string>();
+	// an unreadable `.gitignore` drops its rules AND leaves the build-output
+	// heuristic on for its subtree (no anchor is pushed), as on the CLI
+	const gitignores = in_repo
+		? ignore_texts(
+				folder,
+				gitignore_file_name,
+				await collect_ignore_files(folder, gitignore_file_name),
+				warnings
+			)
+		: new Map<string, string>();
+
 	// which directories hold a `.prettierignore` at all — the shadow hint is keyed on
 	// presence (a shadowed one is never read, so it can earn no read warning), and
 	// outside a repo none is read, but the folder-root one's presence is exactly what
 	// the outside-repo hint is about
 	const prettierignore_present = new Set<string>();
+	let prettierignores = new Map<string, string>();
 	if (in_repo) {
-		// an unreadable `.gitignore` drops its rules AND leaves the build-output
-		// heuristic on for its subtree (no anchor is pushed), as on the CLI
-		gitignores = split_ignore_reads(
-			folder,
-			gitignore_file_name,
-			await collect_ignore_files(folder, gitignore_file_name),
-			warnings
-		).texts;
-		// `.prettierignore` is hierarchical inside a repo (like `.formatignore`);
-		// per-directory shadowing by a sibling `.formatignore` is applied in
-		// `tsv_layer_for_dir`, so read every UNSHADOWED one here — a shadowed one
-		// goes unread on the CLI too, its presence alone reported by the shadow hint
-		const prettierignore_reads = await collect_ignore_files(folder, prettierignore_file_name);
-		for (const dir of prettierignore_reads.keys()) {
+		// `.prettierignore` is hierarchical inside a repo (like `.formatignore`), read
+		// wherever no sibling `.formatignore` is present — the per-directory shadow is
+		// applied HERE, on presence: a shadowed one goes unread on the CLI too, its
+		// presence alone reported by the shadow hint
+		const reads = await collect_ignore_files(folder, prettierignore_file_name);
+		for (const dir of reads.keys()) {
 			prettierignore_present.add(dir);
-			if (formatignores.has(dir) || formatignore_unreadable.has(dir)) {
-				prettierignore_reads.delete(dir);
-			}
+			if (formatignore_present.has(dir)) reads.delete(dir);
 		}
-		prettierignores = split_ignore_reads(
-			folder,
-			prettierignore_file_name,
-			prettierignore_reads,
-			warnings
-		).texts;
-	} else {
-		const root_read = await read_ignore_file(
-			vscode.Uri.joinPath(folder.uri, prettierignore_file_name)
-		);
-		if (root_read.kind !== 'absent') prettierignore_present.add('');
+		prettierignores = ignore_texts(folder, prettierignore_file_name, reads, warnings);
+	} else if (await path_exists(vscode.Uri.joinPath(folder.uri, prettierignore_file_name))) {
+		prettierignore_present.add('');
 	}
 
 	const hints = ignore_hints(
 		folder,
 		in_repo,
-		formatignores,
-		formatignore_unreadable,
+		formatignore_present,
 		prettierignore_present,
 		warnings
 	);
@@ -385,9 +383,7 @@ const reload_ignore_folder = async (folder: vscode.WorkspaceFolder): Promise<voi
 	// `.gitignore` save carries the same hints, and repeating them is noise; a set
 	// that shrank to nothing is silence, not a line (nothing is unread any more)
 	if (hints.length > 0 && (previous === undefined || !same_lines(previous.hints, hints))) {
-		for (const hint of hints) {
-			output_channel?.appendLine(`[${new Date().toISOString()}] ${hint}`);
-		}
+		for (const hint of hints) log_line(hint);
 	}
 };
 
@@ -396,7 +392,7 @@ const same_lines = (a: string[], b: string[]): boolean =>
 
 /**
  * The heads-ups tsv's CLI writes to stderr, as one sorted list: the read warnings
- * (`split_ignore_reads`) plus the two `.prettierignore` hints — an ignore file
+ * (`ignore_texts`) plus the two `.prettierignore` hints — an ignore file
  * whose rules go unread, which is a silent misconfiguration the editor would
  * otherwise never surface. The two hints are phrased by the shared matcher so the
  * wording cannot drift from the CLI's, and keyed on PRESENCE (a file's listing, not
@@ -418,15 +414,12 @@ const same_lines = (a: string[], b: string[]): boolean =>
 const ignore_hints = (
 	folder: vscode.WorkspaceFolder,
 	in_repo: boolean,
-	formatignores: Map<string, string>,
-	formatignore_unreadable: Set<string>,
+	formatignore_present: Set<string>,
 	prettierignore_present: Set<string>,
 	warnings: string[]
 ): string[] => {
 	const hints = [...warnings];
 	if (!ignore_stack_ctor) return hints.sort();
-	const has_formatignore = (dir: string): boolean =>
-		formatignores.has(dir) || formatignore_unreadable.has(dir);
 	const stack = new ignore_stack_ctor();
 	try {
 		if (in_repo) {
@@ -436,7 +429,7 @@ const ignore_hints = (
 					dir === '' ? folder.name : `${folder.name}/${dir}`,
 					true,
 					true,
-					has_formatignore(dir)
+					formatignore_present.has(dir)
 				);
 				if (hint !== undefined) hints.push(hint);
 			}
@@ -447,7 +440,7 @@ const ignore_hints = (
 				folder.name,
 				false,
 				prettierignore_present.has(''),
-				has_formatignore('')
+				formatignore_present.has('')
 			);
 			if (hint !== undefined) hints.push(hint);
 		}
@@ -584,7 +577,7 @@ const formatter_for_document = (
 
 const report_format_failure = (document: vscode.TextDocument, err: unknown): void => {
 	last_failure_uri = document.uri.toString();
-	output_channel?.appendLine(`[${new Date().toISOString()}] ${document.uri.fsPath}`);
+	log_line(document.uri.fsPath);
 	output_channel?.appendLine(to_error_message(err));
 	output_channel?.appendLine('');
 	if (status_item) {
