@@ -43,6 +43,18 @@ not one per save; a set that shrinks to nothing is silence, not a line. The
 a `.gitignore` turning the build-output heuristic off, which changes nothing the user
 configured.
 
+An ignore file that is **present but unreadable** — a read error, or invalid UTF-8
+(reading is strict UTF-8, as on both CLIs, never a lenient decode into patterns nobody
+wrote) — follows the CLI too: its rules are dropped and the CLI's own line
+(`could not read <path> (<reason>); its ignore rules are not applied`, restated by hand
+from `cli.js` since the two `tsv` bins template it themselves) joins the hint set. An
+absent file stays silent (`FileSystemError.FileNotFound`, or `ENOENT` through a custom
+provider). Precedence is by **presence**, not readability: an unreadable
+`.formatignore` still shadows its sibling `.prettierignore`, an unreadable `.gitignore`
+still leaves the build-output heuristic on for its subtree (no anchor is pushed), and
+a shadowed `.prettierignore` is never read at all, so it earns the shadow hint alone.
+This is what keeps a save touching the same files `tsv format` would.
+
 The **workspace folder is treated as the eval root** (the common case where it is
 the repo root). The CLI walks up to the `.git` repo root; the extension does not —
 ignore files in ancestors *above* an opened subdirectory are out of scope (and

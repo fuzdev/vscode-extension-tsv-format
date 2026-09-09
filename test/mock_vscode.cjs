@@ -51,6 +51,10 @@ const TextEdit = {
 
 const StatusBarAlignment = { Left: 1, Right: 2 };
 
+// the shape of `vscode.FileSystemError.FileNotFound()`: the extension keys
+// "absent" (silent) vs "unreadable" (warned) on this code
+const not_found = (uri) => Object.assign(new Error(`ENOENT ${uri.path}`), { code: 'FileNotFound' });
+
 const folders = () => [{ uri: Uri.file(world.folder_path), name: 'repo', index: 0 }];
 
 const workspace = {
@@ -81,12 +85,20 @@ const workspace = {
 		async stat(uri) {
 			if (world.files.has(uri.path)) return { type: 1 };
 			if (world.dirs.has(uri.path)) return { type: 2 };
-			throw new Error(`ENOENT ${uri.path}`);
+			throw not_found(uri);
 		},
+		// a file's content may be raw bytes (so a test can hand the extension invalid
+		// UTF-8), and a path in `world.unreadable` is present but fails to read — the
+		// two ways an ignore file is present-but-unreadable
 		async readFile(uri) {
 			const content = world.files.get(uri.path);
-			if (content === undefined) throw new Error(`ENOENT ${uri.path}`);
-			return enc.encode(content);
+			if (content === undefined) throw not_found(uri);
+			if (world.unreadable?.has(uri.path)) {
+				throw Object.assign(new Error(`EACCES: permission denied, open '${uri.path}'`), {
+					code: 'NoPermissions'
+				});
+			}
+			return typeof content === 'string' ? enc.encode(content) : content;
 		}
 	},
 	createFileSystemWatcher() {

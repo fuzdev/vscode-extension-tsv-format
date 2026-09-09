@@ -110,11 +110,15 @@ interface FolderIgnore {
 	// `.gitignore` text keyed by the directory holding it, relative to the folder
 	// root (`''` = the folder root). Populated only when `in_repo`.
 	gitignores: Map<string, string>;
-	// `.formatignore` text keyed by directory (hierarchical, both regimes).
+	// `.formatignore` text keyed by directory (hierarchical, both regimes). A
+	// present-but-unreadable one (a read error, or invalid UTF-8 — reading is strict
+	// UTF-8, as on both CLIs) has no entry: its rules are dropped, warned in `hints`.
 	formatignores: Map<string, string>;
-	// `.prettierignore` text keyed by directory (hierarchical, inside a repo only),
-	// each shadowed per-directory by a sibling `.formatignore` in `tsv_layer_for_dir`.
-	// Empty outside a repo.
+	// `.prettierignore` text keyed by directory (hierarchical, inside a repo only) —
+	// the UNSHADOWED ones only: a directory with a sibling `.formatignore` never has
+	// its `.prettierignore` read, as on the CLI, and that is keyed on the
+	// `.formatignore`'s PRESENCE, not its readability, so a read error can't silently
+	// demote tsv's native file to prettier's. Empty outside a repo.
 	prettierignores: Map<string, string>;
 	// the `.prettierignore` heads-ups this state carries (see `ignore_hints`), kept so
 	// a reload that changes nothing re-logs nothing — the watcher fires on every
@@ -129,7 +133,10 @@ interface FolderIgnore {
 // per-document `IgnoreStack` is assembled from it synchronously, then freed.
 let ignore_stack_ctor: IgnoreStackCtor | undefined;
 const folder_ignores = new Map<string, FolderIgnore>();
-const ignore_text_decoder = new TextDecoder();
+// strict, like both CLIs: an ignore file that is not valid UTF-8 is unreadable
+// (warned, rules dropped), never decoded with replacement characters into
+// patterns nobody wrote
+const ignore_text_decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 /** The directory of an ignore file at `uri_path`, relative to the folder `root`
  * (`''` = the folder root). URIs are `/`-separated. */
@@ -168,26 +175,63 @@ const folder_is_repo = async (folder: vscode.WorkspaceFolder): Promise<boolean> 
 	}
 };
 
-/** Read one ignore file's text, or `undefined` when it is absent/unreadable. */
-const read_ignore_file = async (uri: vscode.Uri): Promise<string | undefined> => {
+/**
+ * One ignore file's read outcome — the CLI's three-way split. `absent` is silent
+ * (nothing there, or deleted between the listing and the read); `unreadable` is a
+ * present file whose rules cannot be applied (a read error, or invalid UTF-8), which
+ * is warned rather than silently treated as absent; `content` is its text.
+ */
+type IgnoreRead =
+	| { kind: 'absent' }
+	| { kind: 'unreadable'; reason: string }
+	| { kind: 'content'; content: string };
+
+/** Whether a `workspace.fs` failure means the file is not there at all. */
+const is_not_found = (err: unknown): boolean => {
+	const code = (err as { code?: unknown } | null)?.code;
+	// `vscode.FileSystemError.FileNotFound` carries `code: 'FileNotFound'`; a Node
+	// error surfacing through a custom provider carries `'ENOENT'`
+	return code === 'FileNotFound' || code === 'ENOENT';
+};
+
+/** Read one ignore file: its text, or why it could not be applied. */
+const read_ignore_file = async (uri: vscode.Uri): Promise<IgnoreRead> => {
+	let bytes: Uint8Array;
 	try {
-		return ignore_text_decoder.decode(await vscode.workspace.fs.readFile(uri));
+		bytes = await vscode.workspace.fs.readFile(uri);
+	} catch (err) {
+		if (is_not_found(err)) return { kind: 'absent' };
+		return { kind: 'unreadable', reason: to_error_message(err) };
+	}
+	try {
+		return { kind: 'content', content: ignore_text_decoder.decode(bytes) };
 	} catch {
-		return undefined;
+		return { kind: 'unreadable', reason: 'invalid UTF-8' };
 	}
 };
 
-/** Every ignore file of one name under `folder` (excluding node_modules), keyed
- * by the directory holding it. `findFiles`' `**​/` prefix can miss the folder-root
- * file, so the caller reads that one explicitly. Never rejects: a `findFiles`
- * failure is logged and yields an empty map, so the caller still degrades to the
- * folder-root file plus structural pruning instead of aborting activation. */
+/**
+ * The CLI's stderr line for a present-but-unreadable ignore file, restated by hand
+ * (the two `tsv` bins template it themselves rather than taking it from the shared
+ * matcher — `crates/tsv_wasm/npm/cli.js` `read_ignore_file`), so the editor's
+ * Output line reads the same as the CLI's.
+ */
+const unreadable_warning = (display_path: string, reason: string): string =>
+	`could not read ${display_path} (${reason}); its ignore rules are not applied`;
+
+/** Every PRESENT ignore file of one name under `folder` (excluding node_modules),
+ * keyed by the directory holding it — its text, or `unreadable` with the reason (an
+ * absent read, the file deleted between the listing and the read, is dropped).
+ * `findFiles`' `**​/` prefix can miss the folder-root file, so the caller reads that
+ * one explicitly. Never rejects: a `findFiles` failure is logged and yields an empty
+ * map, so the caller still degrades to the folder-root file plus structural pruning
+ * instead of aborting activation. */
 const find_ignore_files = async (
 	folder: vscode.WorkspaceFolder,
 	name: string
-): Promise<Map<string, string>> => {
+): Promise<Map<string, IgnoreRead>> => {
 	const root = folder.uri.path;
-	const out = new Map<string, string>();
+	const out = new Map<string, IgnoreRead>();
 	let found: vscode.Uri[];
 	try {
 		found = await vscode.workspace.findFiles(
@@ -207,10 +251,54 @@ const find_ignore_files = async (
 		return out;
 	}
 	for (const uri of found) {
-		const text = await read_ignore_file(uri);
-		if (text !== undefined) out.set(ignore_dir_rel(root, uri.path), text);
+		const read = await read_ignore_file(uri);
+		if (read.kind !== 'absent') out.set(ignore_dir_rel(root, uri.path), read);
 	}
 	return out;
+};
+
+/**
+ * Every present ignore file of one name under `folder`: `find_ignore_files` plus
+ * the explicit folder-root read `**​/` can miss (`root_read` — inside a repo the
+ * root `.gitignore` / `.prettierignore`, both regimes the root `.formatignore`).
+ */
+const collect_ignore_files = async (
+	folder: vscode.WorkspaceFolder,
+	name: string
+): Promise<Map<string, IgnoreRead>> => {
+	const files = await find_ignore_files(folder, name);
+	if (!files.has('')) {
+		const root_read = await read_ignore_file(vscode.Uri.joinPath(folder.uri, name));
+		if (root_read.kind !== 'absent') files.set('', root_read);
+	}
+	return files;
+};
+
+/**
+ * Split one name's reads into its texts (the layers to push) and, for every
+ * unreadable one, the CLI's warning line — an unreadable file's rules are dropped,
+ * never silently treated as absent (this is also a `--check` reproducibility hazard
+ * on the CLI, and here the difference between what saves and what `tsv format`
+ * would touch). The display path is folder-relative, like the other hints'.
+ */
+const split_ignore_reads = (
+	folder: vscode.WorkspaceFolder,
+	name: string,
+	reads: Map<string, IgnoreRead>,
+	warnings: string[]
+): { texts: Map<string, string>; unreadable: Set<string> } => {
+	const texts = new Map<string, string>();
+	const unreadable = new Set<string>();
+	for (const [dir, read] of reads) {
+		if (read.kind === 'content') {
+			texts.set(dir, read.content);
+		} else if (read.kind === 'unreadable') {
+			unreadable.add(dir);
+			const display = dir === '' ? `${folder.name}/${name}` : `${folder.name}/${dir}/${name}`;
+			warnings.push(unreadable_warning(display, read.reason));
+		}
+	}
+	return { texts, unreadable };
 };
 
 /**
@@ -225,59 +313,64 @@ const find_ignore_files = async (
 const reload_ignore_folder = async (folder: vscode.WorkspaceFolder): Promise<void> => {
 	if (!ignore_stack_ctor) return;
 	const in_repo = await folder_is_repo(folder);
-	const formatignores = await find_ignore_files(folder, formatignore_file_name);
-	// `**/` can miss the folder-root file — read it explicitly (both regimes), so a
-	// repo-root/folder-root `.formatignore` is honored (and shadows `.prettierignore`)
-	if (!formatignores.has('')) {
-		const root_fmt = await read_ignore_file(
-			vscode.Uri.joinPath(folder.uri, formatignore_file_name)
-		);
-		if (root_fmt !== undefined) formatignores.set('', root_fmt);
-	}
+	// the warnings an ignore file that cannot be applied earns (see `IgnoreRead`),
+	// gathered here and folded into the folder's hint set below
+	const warnings: string[] = [];
+	const formatignore_reads = await collect_ignore_files(folder, formatignore_file_name);
+	const { texts: formatignores, unreadable: formatignore_unreadable } = split_ignore_reads(
+		folder,
+		formatignore_file_name,
+		formatignore_reads,
+		warnings
+	);
 
-	const gitignores = new Map<string, string>();
-	const prettierignores = new Map<string, string>();
-	// outside a repo `.prettierignore` is never READ (only `.formatignore` is), but its
-	// presence is exactly what the outside-repo hint is about, so ask once either way
-	let root_prettierignore_present = false;
+	let gitignores = new Map<string, string>();
+	let prettierignores = new Map<string, string>();
+	// which directories hold a `.prettierignore` at all — the shadow hint is keyed on
+	// presence (a shadowed one is never read, so it can earn no read warning), and
+	// outside a repo none is read, but the folder-root one's presence is exactly what
+	// the outside-repo hint is about
+	const prettierignore_present = new Set<string>();
 	if (in_repo) {
-		for (const [dir, text] of await find_ignore_files(folder, gitignore_file_name)) {
-			gitignores.set(dir, text);
-		}
-		// `**/` can miss the folder-root file — read it explicitly
-		if (!gitignores.has('')) {
-			const root_gi = await read_ignore_file(vscode.Uri.joinPath(folder.uri, gitignore_file_name));
-			if (root_gi !== undefined) gitignores.set('', root_gi);
-		}
+		// an unreadable `.gitignore` drops its rules AND leaves the build-output
+		// heuristic on for its subtree (no anchor is pushed), as on the CLI
+		gitignores = split_ignore_reads(
+			folder,
+			gitignore_file_name,
+			await collect_ignore_files(folder, gitignore_file_name),
+			warnings
+		).texts;
 		// `.prettierignore` is hierarchical inside a repo (like `.formatignore`);
 		// per-directory shadowing by a sibling `.formatignore` is applied in
-		// `tsv_layer_for_dir`, so read every one here.
-		for (const [dir, text] of await find_ignore_files(folder, prettierignore_file_name)) {
-			prettierignores.set(dir, text);
+		// `tsv_layer_for_dir`, so read every UNSHADOWED one here — a shadowed one
+		// goes unread on the CLI too, its presence alone reported by the shadow hint
+		const prettierignore_reads = await collect_ignore_files(folder, prettierignore_file_name);
+		for (const dir of prettierignore_reads.keys()) {
+			prettierignore_present.add(dir);
+			if (formatignores.has(dir) || formatignore_unreadable.has(dir)) {
+				prettierignore_reads.delete(dir);
+			}
 		}
-		// `**/` can miss the folder-root file — read it explicitly
-		if (!prettierignores.has('')) {
-			const root_pi = await read_ignore_file(
-				vscode.Uri.joinPath(folder.uri, prettierignore_file_name)
-			);
-			if (root_pi !== undefined) prettierignores.set('', root_pi);
-		}
-	}
-
-	if (in_repo) {
-		root_prettierignore_present = prettierignores.has('');
+		prettierignores = split_ignore_reads(
+			folder,
+			prettierignore_file_name,
+			prettierignore_reads,
+			warnings
+		).texts;
 	} else {
-		root_prettierignore_present =
-			(await read_ignore_file(vscode.Uri.joinPath(folder.uri, prettierignore_file_name))) !==
-			undefined;
+		const root_read = await read_ignore_file(
+			vscode.Uri.joinPath(folder.uri, prettierignore_file_name)
+		);
+		if (root_read.kind !== 'absent') prettierignore_present.add('');
 	}
 
 	const hints = ignore_hints(
 		folder,
 		in_repo,
 		formatignores,
-		prettierignores,
-		root_prettierignore_present
+		formatignore_unreadable,
+		prettierignore_present,
+		warnings
 	);
 	const key = folder.uri.toString();
 	const previous = folder_ignores.get(key);
@@ -302,52 +395,59 @@ const same_lines = (a: string[], b: string[]): boolean =>
 	a.length === b.length && a.every((line, i) => line === b[i]);
 
 /**
- * The `.prettierignore` heads-ups tsv's CLI writes to stderr — an ignore file
+ * The heads-ups tsv's CLI writes to stderr, as one sorted list: the read warnings
+ * (`split_ignore_reads`) plus the two `.prettierignore` hints — an ignore file
  * whose rules go unread, which is a silent misconfiguration the editor would
- * otherwise never surface. Two cases, both phrased by the shared matcher so the
- * wording cannot drift from the CLI's:
+ * otherwise never surface. The two hints are phrased by the shared matcher so the
+ * wording cannot drift from the CLI's, and keyed on PRESENCE (a file's listing, not
+ * its readability), exactly as the CLI keys them:
  *
  * - **Outside a repo**, a `.prettierignore` at the folder root is not read at all
  *   (only `.formatignore` is), unless a sibling `.formatignore` already explains it.
  * - **Inside a repo**, a directory holding both files has its `.prettierignore`
- *   shadowed by the sibling `.formatignore`.
+ *   shadowed by the sibling `.formatignore` — a present-but-unreadable
+ *   `.formatignore` included.
  *
  * Computed off the save path (a folder reload only) and logged by the caller to
  * the Output channel, which is not revealed — a hint is information, not a
  * failure, so it must not steal focus from the parse-error indicator.
- * Best-effort: a stack that cannot be built is simply no hint. Sorted, so an
- * unchanged tree yields an identical list whatever order `findFiles` returned.
+ * Best-effort: a stack that cannot be built yields the read warnings alone.
+ * Sorted, so an unchanged tree yields an identical list whatever order `findFiles`
+ * returned.
  */
 const ignore_hints = (
 	folder: vscode.WorkspaceFolder,
 	in_repo: boolean,
 	formatignores: Map<string, string>,
-	prettierignores: Map<string, string>,
-	root_prettierignore_present: boolean
+	formatignore_unreadable: Set<string>,
+	prettierignore_present: Set<string>,
+	warnings: string[]
 ): string[] => {
-	const hints: string[] = [];
-	if (!ignore_stack_ctor) return hints;
+	const hints = [...warnings];
+	if (!ignore_stack_ctor) return hints.sort();
+	const has_formatignore = (dir: string): boolean =>
+		formatignores.has(dir) || formatignore_unreadable.has(dir);
 	const stack = new ignore_stack_ctor();
 	try {
 		if (in_repo) {
-			// per directory: both files present means the tsv layer read the .formatignore
-			for (const dir of prettierignores.keys()) {
+			// per directory: both files present means the tsv layer took the .formatignore
+			for (const dir of prettierignore_present) {
 				const hint = stack.prettierignore_shadowed_warning(
 					dir === '' ? folder.name : `${folder.name}/${dir}`,
 					true,
 					true,
-					formatignores.has(dir)
+					has_formatignore(dir)
 				);
 				if (hint !== undefined) hints.push(hint);
 			}
 		} else {
-			// outside a repo the cache holds no .prettierignore at all (it is never
-			// read), so the folder-root file's presence is the one thing to ask about
+			// outside a repo no .prettierignore is read, so the folder-root file's
+			// presence is the one thing to ask about
 			const hint = stack.prettierignore_outside_repo_warning(
 				folder.name,
 				false,
-				root_prettierignore_present,
-				formatignores.has('')
+				prettierignore_present.has(''),
+				has_formatignore('')
 			);
 			if (hint !== undefined) hints.push(hint);
 		}
@@ -365,13 +465,11 @@ const clear_ignore_folders = (): void => {
 	folder_ignores.clear();
 };
 
-/** The tsv-layer text for one directory: its `.formatignore`, or — when no sibling
- * `.formatignore` is present — its `.prettierignore` (per-directory shadowing). */
-const tsv_layer_for_dir = (state: FolderIgnore, dir: string): string | undefined => {
-	const formatignore = state.formatignores.get(dir);
-	if (formatignore !== undefined) return formatignore;
-	return state.prettierignores.get(dir);
-};
+/** The tsv-layer text for one directory: its `.formatignore`, or its
+ * `.prettierignore` — which the reload stored only where no sibling `.formatignore`
+ * is present (the per-directory shadow is applied at load, on presence). */
+const tsv_layer_for_dir = (state: FolderIgnore, dir: string): string | undefined =>
+	state.formatignores.get(dir) ?? state.prettierignores.get(dir);
 
 /**
  * Whether the document is excluded by its workspace folder's ignore files

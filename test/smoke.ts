@@ -13,22 +13,34 @@ const make_context = () => ({ subscriptions: [] as Array<{ dispose(): void }> })
 
 interface World {
 	folder_path: string;
-	files: Map<string, string>;
+	// raw bytes let a test hand the extension an ignore file that is not valid UTF-8
+	files: Map<string, string | Uint8Array>;
 	dirs: Set<string>;
+	// present files whose read fails (the mock throws a permission error)
+	unreadable: Set<string>;
 	// when set, the mock's `findFiles` rejects — simulating a web-host virtual-FS error
 	find_files_throws?: boolean;
 }
 
+/** A file spec value for a file that is present but cannot be read. */
+const UNREADABLE = Symbol('unreadable');
+
 /** Build a world from a file spec; auto-derives parent dirs and (optionally) `.git`. */
 const build_world = (
-	files: Record<string, string>,
+	files: Record<string, string | Uint8Array | typeof UNREADABLE>,
 	is_repo: boolean,
 	find_files_throws = false
 ): World => {
-	const fmap = new Map<string, string>();
+	const fmap = new Map<string, string | Uint8Array>();
+	const unreadable = new Set<string>();
 	const dirs = new Set<string>([FOLDER]);
 	for (const [rel, content] of Object.entries(files)) {
-		fmap.set(`${FOLDER}/${rel}`, content);
+		if (content === UNREADABLE) {
+			fmap.set(`${FOLDER}/${rel}`, '');
+			unreadable.add(`${FOLDER}/${rel}`);
+		} else {
+			fmap.set(`${FOLDER}/${rel}`, content);
+		}
 		const parts = rel.split('/');
 		parts.pop();
 		let acc = FOLDER;
@@ -38,7 +50,7 @@ const build_world = (
 		}
 	}
 	if (is_repo) dirs.add(`${FOLDER}/.git`);
-	return { folder_path: FOLDER, files: fmap, dirs, find_files_throws };
+	return { folder_path: FOLDER, files: fmap, dirs, unreadable, find_files_throws };
 };
 
 const UNFORMATTED_TS = 'const   x=1';
@@ -83,6 +95,10 @@ const shadow_hint = (dir: string): string =>
 	with_stack((s) => s.prettierignore_shadowed_warning(dir, true, true, true)) ?? '';
 const outside_repo_hint = (dir: string): string =>
 	with_stack((s) => s.prettierignore_outside_repo_warning(dir, false, true, false)) ?? '';
+/** The CLI's line for a present-but-unreadable ignore file (`cli.js` `read_ignore_file`). */
+const unreadable_hint = (display_path: string, reason: string): string =>
+	`could not read ${display_path} (${reason}); its ignore rules are not applied`;
+const PERMISSION_REASON = (rel: string): string => `EACCES: permission denied, open '${FOLDER}/${rel}'`;
 /** The Output lines are `[<iso timestamp>] <hint>`; compare on the hint alone. */
 const hint_lines = (): string[] => output_lines().map((line) => line.replace(/^\[[^\]]*\] /, ''));
 const expect_hints = (label: string, expected: string[]): void =>
@@ -118,7 +134,7 @@ const expect = (label: string, cond: boolean): void => {
 
 const run_scenario = async (
 	name: string,
-	files: Record<string, string>,
+	files: Record<string, string | Uint8Array | typeof UNREADABLE>,
 	is_repo: boolean,
 	cases: Array<[string, string, boolean]>,
 	find_files_throws = false,
@@ -444,6 +460,74 @@ const main = async (): Promise<void> => {
 		],
 		true
 	);
+
+	// 10. present-but-UNREADABLE ignore files (repo): CLI parity. An unreadable file
+	//     is warned and its rules dropped, never silently treated as absent; an
+	//     unreadable .formatignore still SHADOWS its sibling .prettierignore (precedence
+	//     is by presence, not readability — a read error can't demote tsv's native
+	//     file to prettier's); an unreadable .gitignore leaves the build-output
+	//     heuristic ON (no anchor); a shadowed .prettierignore is never read, so it
+	//     earns the shadow hint alone, while an unshadowed unreadable one is warned
+	const INVALID_UTF8 = new Uint8Array([0x73, 0x75, 0x62, 0x2f, 0xff, 0xfe, 0x0a]);
+	await run_scenario(
+		'unreadable ignore files: warned, dropped, presence still shadows',
+		{
+			'.gitignore': UNREADABLE,
+			'.formatignore': UNREADABLE,
+			'.prettierignore': 'p_only.ts\n',
+			'sub/.formatignore': INVALID_UTF8,
+			'sub/.prettierignore': 'sub_p.ts\n',
+			'b/.prettierignore': UNREADABLE,
+			'c/.formatignore': 'c_f.ts\n',
+			'c/.prettierignore': UNREADABLE,
+			'p_only.ts': UNFORMATTED_TS,
+			'sub/sub_p.ts': UNFORMATTED_TS,
+			'sub/keep.ts': UNFORMATTED_TS,
+			'b/keep.ts': UNFORMATTED_TS,
+			'c/c_f.ts': UNFORMATTED_TS,
+			'dist/out.ts': UNFORMATTED_TS,
+			'keep.ts': UNFORMATTED_TS
+		},
+		true,
+		[
+			['p_only.ts', 'typescript', false], // root .prettierignore shadowed by the unreadable .formatignore
+			['sub/sub_p.ts', 'typescript', false], // same, by the invalid-UTF-8 sub/.formatignore
+			['sub/keep.ts', 'typescript', false],
+			['b/keep.ts', 'typescript', false], // b/.prettierignore unreadable: rules dropped
+			['c/c_f.ts', 'typescript', true], // c/.formatignore readable and applied
+			['dist/out.ts', 'typescript', true], // heuristic ON: the root .gitignore is unreadable, no anchor
+			['keep.ts', 'typescript', false]
+		]
+	);
+	expect_hints(
+		'hint: every unreadable file warned once, presence-keyed shadows, no read of a shadowed one',
+		[
+			unreadable_hint('repo/.formatignore', PERMISSION_REASON('.formatignore')),
+			unreadable_hint('repo/.gitignore', PERMISSION_REASON('.gitignore')),
+			unreadable_hint('repo/b/.prettierignore', PERMISSION_REASON('b/.prettierignore')),
+			unreadable_hint('repo/sub/.formatignore', 'invalid UTF-8'),
+			shadow_hint('repo'),
+			shadow_hint('repo/c'),
+			shadow_hint('repo/sub')
+		].sort()
+	);
+
+	// 10b. loose (non-repo) with an unreadable root .formatignore beside a
+	//      .prettierignore: the .formatignore is warned, and its PRESENCE already
+	//      explains the unread .prettierignore, so the outside-repo hint stays quiet
+	await run_scenario(
+		'loose: unreadable formatignore is warned and still explains the prettierignore',
+		{
+			'.formatignore': UNREADABLE,
+			'.prettierignore': 'keep.ts\n',
+			'keep.ts': UNFORMATTED_TS
+		},
+		false,
+		[['keep.ts', 'typescript', false]]
+	);
+	expect_hints('hint: the unreadable .formatignore alone', [
+		unreadable_hint('repo/.formatignore', PERMISSION_REASON('.formatignore'))
+	]);
 
 	console.log(`${pass} passed, ${fail} failed`);
 	if (fail > 0) process.exit(1);
