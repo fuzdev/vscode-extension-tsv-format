@@ -18,6 +18,9 @@ interface World {
 	dirs: Set<string>;
 	// present files whose read fails (the mock throws a permission error)
 	unreadable: Set<string>;
+	// when set, the mock's not-found errors carry no `code` (a provider that reports
+	// a missing file with a bare error) — absence must still be silent
+	bare_not_found_errors?: boolean;
 	// when set, every `readFile` takes its bytes and then waits on this — holds a
 	// reload in flight so a later-started one can finish first
 	read_gate?: Promise<void>;
@@ -32,7 +35,8 @@ const UNREADABLE = Symbol('unreadable');
 const build_world = (
 	files: Record<string, string | Uint8Array | typeof UNREADABLE>,
 	is_repo: boolean,
-	find_files_throws = false
+	find_files_throws = false,
+	bare_not_found_errors = false
 ): World => {
 	const fmap = new Map<string, string | Uint8Array>();
 	const unreadable = new Set<string>();
@@ -53,7 +57,7 @@ const build_world = (
 		}
 	}
 	if (is_repo) dirs.add(`${FOLDER}/.git`);
-	return { folder_path: FOLDER, files: fmap, dirs, unreadable, find_files_throws };
+	return { folder_path: FOLDER, files: fmap, dirs, unreadable, find_files_throws, bare_not_found_errors };
 };
 
 const UNFORMATTED_TS = 'const   x=1';
@@ -154,9 +158,10 @@ const run_scenario = async (
 	find_files_throws = false,
 	// runs while the extension is still active, with the world for in-place edits —
 	// the one way to exercise a watcher reload against the cached state
-	while_active?: (world: World) => Promise<void>
+	while_active?: (world: World) => Promise<void>,
+	bare_not_found_errors = false
 ): Promise<void> => {
-	const world = build_world(files, is_repo, find_files_throws);
+	const world = build_world(files, is_repo, find_files_throws, bare_not_found_errors);
 	set_world(world);
 	const ctx = make_context();
 	// activation awaits the initial ignore-file load, so the cache is ready here
@@ -661,6 +666,61 @@ const main = async (): Promise<void> => {
 				're-added: .git watcher back',
 				same_lines(watcher_patterns().sort(), [IGNORE_GLOB, GIT_PATTERN].sort())
 			);
+		}
+	);
+
+	// 14. a provider whose missing-file error carries no code: the explicit
+	//     folder-root reads of files that are simply not there must stay silent —
+	//     absence is a stat question, never an error-shape guess
+	await run_scenario(
+		'bare not-found errors: absent root files stay silent',
+		{
+			'.gitignore': 'dist/\n',
+			'dist/out.ts': UNFORMATTED_TS,
+			'src/app.ts': UNFORMATTED_TS
+		},
+		true,
+		[
+			['dist/out.ts', 'typescript', true],
+			['src/app.ts', 'typescript', false]
+		],
+		false,
+		async () => {
+			expect_hints('hint: none for absent root files', []);
+		},
+		true
+	);
+
+	// 15. a folder's FIRST load still in flight when the folder is removed and added
+	//     again: the re-add's load must not share a generation with the stale one
+	//     (a per-folder counter reset on removal would hand both the number 1)
+	await run_scenario(
+		'removed and re-added while its first load is in flight',
+		{
+			'.formatignore': 'a.ts\n',
+			'a.ts': UNFORMATTED_TS,
+			'b.ts': UNFORMATTED_TS
+		},
+		true,
+		[['a.ts', 'typescript', true]],
+		false,
+		async (world) => {
+			fire_workspace_folders_changed('removed');
+			let release = (): void => {};
+			world.read_gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			fire_workspace_folders_changed('added'); // load A: the folder's first, holds
+			await settle();
+			world.read_gate = undefined;
+			world.files.set(`${FOLDER}/.formatignore`, 'b.ts\n');
+			fire_workspace_folders_changed('removed');
+			fire_workspace_folders_changed('added'); // load B: also the folder's first
+			await settle();
+			expect('re-add race: the later load landed', is_ignored('b.ts') && !is_ignored('a.ts'));
+			release();
+			await settle();
+			expect('re-add race: the stale first load was discarded', is_ignored('b.ts') && !is_ignored('a.ts'));
 		}
 	);
 

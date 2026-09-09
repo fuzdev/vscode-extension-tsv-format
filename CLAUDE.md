@@ -106,11 +106,16 @@ pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the r
   the hint set — prebuilt off the save path and refreshed via a `FileSystemWatcher`
   over `**/.{gitignore,prettierignore,formatignore}` (events under `node_modules`
   are skipped — `findFiles` never looks there, so they can't change the state) plus
-  the per-folder `.git` watcher. A reload reads every ignore file concurrently, and
-  a per-folder generation counter makes the latest-STARTED reload win: one whose
-  reads finished after a newer one began drops its result, so a burst of events (an
-  editor saving twice, a `git checkout` touching several ignore files) can never
-  leave the earlier snapshot cached. On save it assembles a
+  the per-folder `.git` watcher, both installed before the initial load so nothing
+  written during it is missed. A reload reads every ignore file concurrently; the
+  folder-root files `**/` misses are stat-ed before they are read, so an absent one
+  is silent whatever error shape a virtual-FS provider uses for a missing file
+  (classifying a bare error as "unreadable" would fabricate three warnings per
+  reload and a phantom `.formatignore` shadow). A generation counter — one across
+  folders, so a folder removed and re-added mid-load can't reuse a number — makes
+  the latest-STARTED reload win: one whose reads finished after a newer one began
+  drops its result, so a burst of events (an editor saving twice, a `git checkout`
+  touching several ignore files) can never leave the earlier snapshot cached. On save it assembles a
   per-document `IgnoreStack` from that cache (synchronously), runs `is_ignored` +
   `is_path_pruned`, and frees it, so the provider stays synchronous. Activation
   **awaits** that initial load before registering the provider, closing the

@@ -53,7 +53,12 @@ const StatusBarAlignment = { Left: 1, Right: 2 };
 
 // the shape of `vscode.FileSystemError.FileNotFound()`: the extension keys
 // "absent" (silent) vs "unreadable" (warned) on this code
-const not_found = (uri) => Object.assign(new Error(`ENOENT ${uri.path}`), { code: 'FileNotFound' });
+// (a world may ask for BARE errors instead — a virtual-FS provider that reports a
+// missing file with no code at all, which the extension must still read as absent)
+const not_found = (uri) =>
+	world.bare_not_found_errors
+		? new Error(`no such file: ${uri.path}`)
+		: Object.assign(new Error(`ENOENT ${uri.path}`), { code: 'FileNotFound' });
 
 const folders = () => [{ uri: Uri.file(world.folder_path), name: 'repo', index: 0 }];
 
