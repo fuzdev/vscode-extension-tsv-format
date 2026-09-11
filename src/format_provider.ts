@@ -22,11 +22,14 @@ export interface TsvFormatters {
  * freed per document (never unwound while traversing), so the package's
  * `pop_gitignore` / `pop_tsv` are omitted — as are `is_empty`, `should_format_file`
  * (the extension dispatches by `languageId`, not by extension, so it never needs
- * that helper's filter), `heuristic_shadow_warning` (the extension prunes silently —
- * that hint is about a `.gitignore` turning the build-output heuristic off, which
- * changes nothing a user configured), and `classify_dir` (the per-directory verdict
- * for a top-down *traverser*; the extension has no traversal and uses the per-file
- * `is_path_pruned` instead). The two **`.prettierignore`** hints are typed and used:
+ * that helper's filter), `classify_dir` (the per-directory verdict for a top-down
+ * *traverser*; the extension has no traversal and uses the per-file `is_path_pruned`
+ * instead), and `heuristic_shadow_warning`. That hint names a real misconfiguration: a
+ * tsv-layer `!` re-include written under a directory the build-output heuristic prunes
+ * (`!dist/keep.ts`) does nothing, since git's parent-directory rule bars a re-include
+ * inside an excluded directory. The CLI raises it from its walk, at the pruned
+ * directory; the extension has no walk, so such a file is skipped silently. The two
+ * **`.prettierignore`** hints are typed and used:
  * each names an ignore file whose rules go unread, which is a silent
  * misconfiguration rather than a pruning detail, so `report_ignore_hints` logs them
  * to the Output channel exactly as the CLI writes them to stderr.
@@ -381,6 +384,12 @@ const gitignore_symlink_warning = (display_path: string): string =>
  * listing here instead of by an exclude glob — the walk never descends into them, so an
  * ignore file under one is never read by the CLI either. One scan for the three names,
  * so the unexcluded walk (`node_modules` included) is paid once per reload.
+ * Symbolic links follow the user's `search.followSymlinks` (on by default), which
+ * `findFiles` hands ripgrep as `--follow`. Turned off, the listing holds no symlinked
+ * file of any name: a symlinked `.gitignore` loses only its warning (its rules are
+ * dropped either way), but a nested symlinked `.formatignore` / `.prettierignore`, which
+ * the CLI reads through the link, goes unapplied and shadows no sibling. The folder-root
+ * files are stat-ed directly (`collect_ignore_files`), so they are unaffected.
  * Never rejects: a `findFiles` failure is logged and yields empty listings, so the
  * caller still degrades to the folder-root files plus structural pruning instead of
  * aborting activation.
@@ -418,8 +427,9 @@ const scan_ignore_files = async (
 /**
  * Every present ignore file of one name under `folder`, keyed by the directory holding
  * it — its `IgnoreRead`, an absent one dropped: the `listed` URIs read concurrently,
- * plus the explicit folder-root read `**​/` can miss (inside a repo the root `.gitignore`
- * / `.prettierignore`, both regimes the root `.formatignore`). Every one is stat-ed
+ * plus an explicit folder-root read wherever the listing has none (inside a repo the root
+ * `.gitignore` / `.prettierignore`, both regimes the root `.formatignore`) — a backstop, so
+ * the root files survive a `findFiles` rejection. Every one is stat-ed
  * before it is read and graded by `presence`, the name's rule, so a directory of that
  * name is absent and a symlinked `.gitignore` is `symlink` in the listing and at the
  * root alike. The root file is usually NOT there, so ANY failure of its stat is
@@ -949,7 +959,14 @@ const format_document = (
 	// honor .gitignore / .formatignore / .prettierignore on save (and explicit
 	// Format Document — VSCode routes both through this provider with no way to
 	// tell them apart, so both skip an ignored file, matching prettier-vscode)
-	if (is_document_ignored(document)) return [];
+	// TODO: once the pinned range carries it, log `path_heuristic_shadow_warning(rel,
+	// loose_root)` when `is_path_pruned` skips a save, deduped per folder reload
+	if (is_document_ignored(document)) {
+		// a skipped document is not formatted at all, so a parse-error indicator it left
+		// before an ignore file came to cover it no longer describes anything
+		clear_format_failure(document);
+		return [];
+	}
 	const source = document.getText();
 	let formatted: string;
 	try {

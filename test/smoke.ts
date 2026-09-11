@@ -75,7 +75,15 @@ const build_world = (
 		}
 	}
 	if (is_repo) dirs.add(`${FOLDER}/.git`);
-	return { folder_path: FOLDER, files: fmap, dirs, unreadable, symlinks, find_files_throws, bare_not_found_errors };
+	return {
+		folder_path: FOLDER,
+		files: fmap,
+		dirs,
+		unreadable,
+		symlinks,
+		find_files_throws,
+		bare_not_found_errors
+	};
 };
 
 const UNFORMATTED_TS = 'const   x=1';
@@ -106,7 +114,9 @@ const fire_watcher = (kind: 'create' | 'change' | 'delete', rel: string): void =
 const watcher_patterns = (): string[] =>
 	(vscode as unknown as { __watcher_patterns(): string[] }).__watcher_patterns();
 const fire_workspace_folders_changed = (kind: 'added' | 'removed'): void =>
-	(vscode as unknown as { __fire_workspace_folders_changed(k: string): void }).__fire_workspace_folders_changed(kind);
+	(
+		vscode as unknown as { __fire_workspace_folders_changed(k: string): void }
+	).__fire_workspace_folders_changed(kind);
 /** Whether the live provider skips `rel` (no edits for unformatted content). */
 const is_ignored = (rel: string): boolean =>
 	(get_provider().provideDocumentFormattingEdits(make_doc(rel, 'typescript', UNFORMATTED_TS)) ?? [])
@@ -818,10 +828,7 @@ const main = async (): Promise<void> => {
 
 			fire_workspace_folders_changed('removed');
 			expect('removed: state dropped, nothing ignored', !is_ignored('dist/out.ts'));
-			expect(
-				'removed: its .git watcher disposed',
-				same_lines(watcher_patterns(), [IGNORE_GLOB])
-			);
+			expect('removed: its .git watcher disposed', same_lines(watcher_patterns(), [IGNORE_GLOB]));
 			fire_workspace_folders_changed('added');
 			await settle();
 			expect('re-added: state reloaded', is_ignored('dist/out.ts'));
@@ -883,10 +890,12 @@ const main = async (): Promise<void> => {
 			expect('re-add race: the later load landed', is_ignored('b.ts') && !is_ignored('a.ts'));
 			release();
 			await settle();
-			expect('re-add race: the stale first load was discarded', is_ignored('b.ts') && !is_ignored('a.ts'));
+			expect(
+				're-add race: the stale first load was discarded',
+				is_ignored('b.ts') && !is_ignored('a.ts')
+			);
 		}
 	);
-
 
 	// 16. a `.git` FILE (a worktree's or submodule's) counts as in-repo, as on both CLIs
 	await run_scenario(
@@ -999,7 +1008,10 @@ const main = async (): Promise<void> => {
 		const ctx = make_context();
 		await activate_formatter(ctx as never, formatters, IgnoreStack as never);
 		expect('nested folder: root .gitignore reaches it', is_ignored('packages/a/foo.gen.ts'));
-		expect('nested folder: its .prettierignore is read via the root', is_ignored('packages/a/p.ts'));
+		expect(
+			'nested folder: its .prettierignore is read via the root',
+			is_ignored('packages/a/p.ts')
+		);
 		expect('nested folder: plain source formats', !is_ignored('packages/a/keep.ts'));
 		expect_hints('hint: none — the nested .prettierignore is read, not outside a repo', []);
 		expect(
@@ -1015,6 +1027,32 @@ const main = async (): Promise<void> => {
 		for (const subscription of ctx.subscriptions) subscription.dispose();
 		expect('nested folder: no watcher outlives deactivation', watcher_patterns().length === 0);
 	}
+
+	// 20. a parse-error indicator left by a document an ignore file then comes to cover:
+	//     the skipped save formats nothing, so the indicator is cleared rather than left
+	//     describing a file tsv no longer touches
+	await run_scenario(
+		'stale status on an ignored save',
+		{ '.formatignore': '# nothing\n' },
+		false,
+		[],
+		false,
+		async (world) => {
+			const provider = get_provider();
+			const status = get_status();
+			const bad = make_doc('bad.ts', 'typescript', 'const x = (');
+			provider.provideDocumentFormattingEdits(bad);
+			expect('stale status: a parse error shows the indicator', status.visible);
+			world.files.set(`${FOLDER}/.formatignore`, 'bad.ts\n');
+			fire_watcher('change', '.formatignore');
+			await settle();
+			expect(
+				'stale status: the covered document is skipped',
+				(provider.provideDocumentFormattingEdits(bad) ?? []).length === 0
+			);
+			expect('stale status: the skipped save clears the indicator', !status.visible);
+		}
+	);
 
 	console.log(`${pass} passed, ${fail} failed`);
 	if (fail > 0) process.exit(1);

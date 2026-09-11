@@ -43,9 +43,15 @@ to the directories `tsv format <folder>` descends into: the listing reads the ig
 inside a directory a rule or the build-output heuristic prunes too (harmless — a layer
 there changes no verdict), but the CLI's walk never does, so an unreadable or symlinked
 file, or a shadow, in one is not logged. The
-`heuristic_shadow_warning` hint is deliberately *not* surfaced — it reports
-a `.gitignore` turning the build-output heuristic off, which changes nothing the user
-configured.
+`heuristic_shadow_warning` hint is *not* surfaced, though it names a real
+misconfiguration: a tsv-layer `!` re-include written under a directory the build-output
+heuristic prunes (`!dist/keep.ts` in a loose folder's `.formatignore`) does nothing, since
+git's parent-directory rule bars a re-include inside an excluded directory. The CLI raises
+it from its walk, at the pruned directory, pointing at the directory-level re-include that
+works; the extension has no walk to raise it from, so a save of such a file is skipped
+silently. The binding past the pinned range answers it per file
+(`path_heuristic_shadow_warning(rel, loose_root?)`), so logging it on a skipped save waits
+on the range bump.
 
 An ignore file that is **present but unreadable** — a read error, or invalid UTF-8
 (reading is strict UTF-8, as on both CLIs, never a lenient decode into patterns nobody
@@ -70,6 +76,18 @@ heuristic stays on for its subtree — and the CLI's own line (`<path> is a symb
 which git does not follow in a working tree; its ignore rules are not applied`, restated by
 hand, since the pinned binding predates `gitignore_symlink_warning`) joins the hint set.
 `.formatignore` and `.prettierignore` keep reading through links, as prettier does.
+
+The listing's view of links is the user's **`search.followSymlinks`** (default on):
+`findFiles` passes it to ripgrep as `--follow`, and without that flag ripgrep lists no
+symlinked file of any name (checked against VS Code 1.121 and its bundled ripgrep). Turned off,
+a nested symlinked `.gitignore` loses only its warning — its rules are dropped either way,
+and no anchor is pushed either way — but a nested symlinked `.formatignore` /
+`.prettierignore`, which the CLI reads through the link, is missing too: its rules go
+unapplied, and a missing `.formatignore` shadows no sibling `.prettierignore`, which is
+then read in its place. The folder-root files are unaffected (stat-ed directly, never
+listed). Left as a known gap: `findFiles` takes no per-call link option at the
+`engines.vscode` floor. With the setting on, the listing also descends symlinked
+directories, which the CLI's walk does not follow.
 
 The **workspace folder is treated as the eval root** (the common case where it is
 the repo root). The CLI walks up to the `.git` repo root; the extension does not —
@@ -130,11 +148,13 @@ pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the r
   `format_*` dispatch (ts/js/css/svelte only), `.svelte` fileName fallback (now
   defensive — the manifest `contributes.languages` owns the `.svelte` → `svelte`
   association, so the id is present even without the Svelte extension),
-  status-bar + `tsv` Output channel for parse failures and the `.prettierignore`
-  heads-ups, and the gitignore-aware skip logic. Per workspace folder it caches `{in_repo, gitignores, formatignores,
+  status-bar + `tsv` Output channel for parse failures (the indicator clears when the
+  failing document formats, closes, or is skipped because an ignore file now covers it)
+  and the `.prettierignore` heads-ups, and the gitignore-aware skip logic. Per workspace folder it caches `{in_repo, gitignores, formatignores,
   prettierignores}` — the `.gitignore` / `.formatignore` / `.prettierignore` texts
   keyed by directory (one `findFiles` listing for the three names, plus an
-  explicit folder-root read as a backstop for a listing that misses depth 0;
+  explicit folder-root read as a backstop — VS Code's `**/` does list depth 0, but the
+  root files are the ones that must survive a `findFiles` rejection;
   `.prettierignore` hierarchically inside a repo, each shadowed per-directory by a
   sibling `.formatignore`), the `.git` regime flag and the hint set. The listing's
   exclude is `null` on purpose: `findFiles` applies the user's `files.exclude` on
@@ -151,8 +171,8 @@ pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the r
   written during it is missed. A reload reads every ignore file concurrently, each
   stat-ed first and graded by its name's presence rule (`tsv_layer_presence` /
   `gitignore_presence`: a directory of that name is absent, a symlinked `.gitignore`
-  is warned — one stat per listed file on top of its read); for the folder-root files
-  `**/` misses, any stat failure is absence, so an absent one
+  is warned — one stat per listed file on top of its read); for the folder-root
+  backstop, which asks whether a file is there at all, any stat failure is absence, so an absent one
   is silent whatever error shape a virtual-FS provider uses for a missing file
   (classifying a bare error as "unreadable" would fabricate three warnings per
   reload and a phantom `.formatignore` shadow). A generation counter — one across

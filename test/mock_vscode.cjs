@@ -1,8 +1,8 @@
 // Minimal mock of the `vscode` module for the smoke test (test/smoke.ts). Backed
 // by an in-memory "world" (files + dirs under one workspace folder, optionally
 // with nested workspace folders) set per scenario. findFiles deliberately omits
-// the folder-root file from its listing — so the provider's explicit-root-read
-// backstop is exercised (the absence of which was a real bug this test caught).
+// the folder-root file from its listing — harsher than VS Code, whose `**/` lists
+// depth 0 — so the provider's explicit-root-read backstop is always exercised.
 'use strict';
 
 let world = { folder_path: '/repo', files: new Map(), dirs: new Set() };
@@ -104,7 +104,7 @@ const workspace = {
 		for (const p of world.files.keys()) {
 			if (!p.startsWith(`${root}/`)) continue;
 			const rel = p.slice(root.length + 1);
-			// `**/` requires at least one dir segment — root-level files are missed
+			// root-level files are left out on purpose (see the header)
 			if (!rel.includes('/')) continue;
 			if (names.has(rel.slice(rel.lastIndexOf('/') + 1))) out.push(Uri.file(p));
 		}
@@ -282,14 +282,19 @@ module.exports = {
 	},
 	/** The live (undisposed) watchers' patterns, so a test can assert on disposal. */
 	__watcher_patterns() {
-		return watchers.map((w) => (typeof w.pattern === 'string' ? w.pattern : `<folder>/${w.pattern.pattern}`));
+		return watchers.map((w) =>
+			typeof w.pattern === 'string' ? w.pattern : `<folder>/${w.pattern.pattern}`
+		);
 	},
 	/** Remove / re-add the main mock folder: `workspaceFolders` reflects it first, then
 	 * the workspace-folders listener fires, as in VS Code. */
 	__fire_workspace_folders_changed(kind) {
 		const folder = { uri: Uri.file(world.folder_path), name: 'repo', index: 0 };
 		main_folder_removed = kind === 'removed';
-		workspace_folders_listener?.({ added: kind === 'added' ? [folder] : [], removed: kind === 'removed' ? [folder] : [] });
+		workspace_folders_listener?.({
+			added: kind === 'added' ? [folder] : [],
+			removed: kind === 'removed' ? [folder] : []
+		});
 	},
 	__get_provider() {
 		return captured_provider;
