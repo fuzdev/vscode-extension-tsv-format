@@ -18,6 +18,9 @@ interface World {
 	dirs: Set<string>;
 	// present files whose read fails (the mock throws a permission error)
 	unreadable: Set<string>;
+	// files that are symbolic links: the mock's `stat` sets the link bit, and a read
+	// follows the link to the content
+	symlinks: Set<string>;
 	// when set, the mock's not-found errors carry no `code` (a provider that reports
 	// a missing file with a bare error) — absence must still be silent
 	bare_not_found_errors?: boolean;
@@ -34,20 +37,32 @@ interface World {
 /** A file spec value for a file that is present but cannot be read. */
 const UNREADABLE = Symbol('unreadable');
 
+/** A file spec value for a symbolic link whose target holds `content`. */
+const SYMLINK = Symbol('symlink');
+type SymlinkSpec = { [SYMLINK]: string };
+const symlink_to = (content: string): SymlinkSpec => ({ [SYMLINK]: content });
+
+/** What a file spec can hold. */
+type FileSpec = string | Uint8Array | typeof UNREADABLE | SymlinkSpec;
+
 /** Build a world from a file spec; auto-derives parent dirs and (optionally) `.git`. */
 const build_world = (
-	files: Record<string, string | Uint8Array | typeof UNREADABLE>,
+	files: Record<string, FileSpec>,
 	is_repo: boolean,
 	find_files_throws = false,
 	bare_not_found_errors = false
 ): World => {
 	const fmap = new Map<string, string | Uint8Array>();
 	const unreadable = new Set<string>();
+	const symlinks = new Set<string>();
 	const dirs = new Set<string>([FOLDER]);
 	for (const [rel, content] of Object.entries(files)) {
 		if (content === UNREADABLE) {
 			fmap.set(`${FOLDER}/${rel}`, '');
 			unreadable.add(`${FOLDER}/${rel}`);
+		} else if (typeof content === 'object' && SYMLINK in content) {
+			fmap.set(`${FOLDER}/${rel}`, content[SYMLINK]);
+			symlinks.add(`${FOLDER}/${rel}`);
 		} else {
 			fmap.set(`${FOLDER}/${rel}`, content);
 		}
@@ -60,7 +75,7 @@ const build_world = (
 		}
 	}
 	if (is_repo) dirs.add(`${FOLDER}/.git`);
-	return { folder_path: FOLDER, files: fmap, dirs, unreadable, find_files_throws, bare_not_found_errors };
+	return { folder_path: FOLDER, files: fmap, dirs, unreadable, symlinks, find_files_throws, bare_not_found_errors };
 };
 
 const UNFORMATTED_TS = 'const   x=1';
@@ -118,6 +133,10 @@ const outside_repo_hint = (dir: string): string =>
 /** The CLI's line for a present-but-unreadable ignore file (`cli.js` `read_ignore_file`). */
 const unreadable_hint = (display_path: string, reason: string): string =>
 	`could not read ${display_path} (${reason}); its ignore rules are not applied`;
+/** The CLI's line for a symlinked `.gitignore` (`tsv_discover::gitignore_symlink_warning`),
+ * restated as the extension restates it: the pinned binding predates the method. */
+const symlink_hint = (display_path: string): string =>
+	`${display_path} is a symbolic link, which git does not follow in a working tree; its ignore rules are not applied`;
 const permission_reason = (rel: string): string =>
 	`EACCES: permission denied, open '${FOLDER}/${rel}'`;
 /** The Output lines are `[<iso timestamp>] <hint>`; compare on the hint alone. */
@@ -155,7 +174,7 @@ const expect = (label: string, cond: boolean): void => {
 
 const run_scenario = async (
 	name: string,
-	files: Record<string, string | Uint8Array | typeof UNREADABLE>,
+	files: Record<string, FileSpec>,
 	is_repo: boolean,
 	cases: Array<[string, string, boolean]>,
 	find_files_throws = false,
@@ -563,6 +582,89 @@ const main = async (): Promise<void> => {
 	expect_hints('hint: the unreadable .formatignore alone', [
 		unreadable_hint('repo/.formatignore', permission_reason('.formatignore'))
 	]);
+
+	// 10c. symlinked .gitignore files (repo): git does not follow one in a working tree, so
+	//      the CLI warns and applies none of the linked rules — they skip nothing, and with
+	//      no anchor the build-output heuristic stays ON — while a symlinked .formatignore
+	//      or .prettierignore is read through, as prettier reads its own. The root files
+	//      take the explicit folder-root read and the nested ones the listing, so both
+	//      paths are covered under both presence rules.
+	await run_scenario(
+		'symlinked .gitignore: warned and not applied; the tsv layer reads through links',
+		{
+			'.gitignore': symlink_to('g.ts\n'),
+			'.prettierignore': symlink_to('p.ts\n'),
+			'sub/.gitignore': symlink_to('s.ts\n'),
+			'sub/.formatignore': symlink_to('f.ts\n'),
+			'g.ts': UNFORMATTED_TS,
+			'p.ts': UNFORMATTED_TS,
+			'sub/s.ts': UNFORMATTED_TS,
+			'sub/f.ts': UNFORMATTED_TS,
+			'dist/out.ts': UNFORMATTED_TS,
+			'keep.ts': UNFORMATTED_TS
+		},
+		true,
+		[
+			['g.ts', 'typescript', false], // the root link's rules are not applied
+			['p.ts', 'typescript', true], // the linked root .prettierignore is read through
+			['sub/s.ts', 'typescript', false], // nor the nested link's
+			['sub/f.ts', 'typescript', true], // the linked .formatignore is read through
+			['dist/out.ts', 'typescript', true], // heuristic ON: no .gitignore anchor
+			['keep.ts', 'typescript', false]
+		]
+	);
+	expect_hints(
+		'hint: each symlinked .gitignore once',
+		[symlink_hint('repo/.gitignore'), symlink_hint('repo/sub/.gitignore')].sort()
+	);
+
+	// 10d. a DIRECTORY named like an ignore file is not one (repo): it holds no rules, so
+	//      it is absent and silent, as on the CLI — no "could not read" warning, no
+	//      .formatignore presence shadowing the root .prettierignore, and no .gitignore
+	//      anchor turning the build-output heuristic off. Only the folder-root probe can
+	//      meet one (the listing holds files alone).
+	await run_scenario(
+		'a directory named like an ignore file is absent',
+		{
+			// a file inside each, so the world derives the directory
+			'.gitignore/x': '',
+			'.formatignore/x': '',
+			'.prettierignore': 'p.ts\n',
+			'p.ts': UNFORMATTED_TS,
+			'dist/out.ts': UNFORMATTED_TS,
+			'keep.ts': UNFORMATTED_TS
+		},
+		true,
+		[
+			['p.ts', 'typescript', true], // the root .prettierignore is read: nothing shadows it
+			['dist/out.ts', 'typescript', true], // heuristic ON: no .gitignore anchor
+			['keep.ts', 'typescript', false]
+		]
+	);
+	expect_hints('hint: none for directories named like ignore files', []);
+
+	// 10e. loose (non-repo): a symlinked .gitignore is not read at all outside a repo, so
+	//      it earns no warning; a symlinked .formatignore is still read through; and a
+	//      DIRECTORY named .prettierignore is no .prettierignore, so the outside-repo hint
+	//      has nothing to report
+	await run_scenario(
+		'loose: no symlink warning, links read through, a .prettierignore directory is silent',
+		{
+			'.gitignore': symlink_to('g.ts\n'),
+			'.prettierignore/x': '',
+			'sub/.formatignore': symlink_to('f.ts\n'),
+			'g.ts': UNFORMATTED_TS,
+			'sub/f.ts': UNFORMATTED_TS,
+			'keep.ts': UNFORMATTED_TS
+		},
+		false,
+		[
+			['g.ts', 'typescript', false], // .gitignore is not read outside a repo
+			['sub/f.ts', 'typescript', true], // the linked .formatignore is read through
+			['keep.ts', 'typescript', false]
+		]
+	);
+	expect_hints('hint: none outside a repo for a linked .gitignore or a .prettierignore dir', []);
 
 	// 11. the `.git` watcher flips the regime: `git init` in an open loose folder
 	//     starts honoring .prettierignore and retires the outside-repo hint (a set

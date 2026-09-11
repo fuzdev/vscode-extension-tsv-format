@@ -113,7 +113,9 @@ interface FolderIgnore {
 	// one it honors only `.formatignore` (hierarchically), exactly like the CLI.
 	in_repo: boolean;
 	// `.gitignore` text keyed by the directory holding it, relative to the folder
-	// root (`''` = the folder root). Populated only when `in_repo`.
+	// root (`''` = the folder root). Populated only when `in_repo`. An unreadable or
+	// symlinked one (git does not follow a link) has no entry: its rules are dropped,
+	// warned in `hints`.
 	gitignores: Map<string, string>;
 	// `.formatignore` text keyed by directory (hierarchical, both regimes). A
 	// present-but-unreadable one (a read error, or invalid UTF-8 — reading is strict
@@ -125,7 +127,8 @@ interface FolderIgnore {
 	// `.formatignore`'s PRESENCE, not its readability, so a read error can't silently
 	// demote tsv's native file to prettier's. Empty outside a repo.
 	prettierignores: Map<string, string>;
-	// the heads-ups this state carries — the unreadable-file warnings and the two
+	// the heads-ups this state carries — the warnings for ignore files whose rules cannot
+	// be applied (unreadable, or a symlinked `.gitignore`) and the two
 	// `.prettierignore` hints (see `ignore_hints`) — kept so a reload that changes
 	// nothing re-logs nothing: the watcher fires on every ignore-file save, and the
 	// same unread file is one line, not one per save
@@ -233,15 +236,23 @@ const root_folder_for = (uri: vscode.Uri): vscode.WorkspaceFolder | undefined =>
 const folder_is_repo = (folder: vscode.WorkspaceFolder): Promise<boolean> =>
 	path_exists(vscode.Uri.joinPath(folder.uri, '.git'));
 
-/** Whether anything exists at `uri` — presence, the listing's question, not a read. */
-const path_exists = async (uri: vscode.Uri): Promise<boolean> => {
+/**
+ * The `stat` type at `uri` (a bitmask — a link carries `SymbolicLink` beside its target's
+ * type), or `undefined` when the stat fails for any reason. A presence question, not a
+ * read: where nothing is usually there, no provider's error shape for a missing entry is
+ * ever classified.
+ */
+const stat_type = async (uri: vscode.Uri): Promise<vscode.FileType | undefined> => {
 	try {
-		await vscode.workspace.fs.stat(uri);
-		return true;
+		return (await vscode.workspace.fs.stat(uri)).type;
 	} catch {
-		return false;
+		return undefined;
 	}
 };
+
+/** Whether anything exists at `uri` — presence, the listing's question, not a read. */
+const path_exists = async (uri: vscode.Uri): Promise<boolean> =>
+	(await stat_type(uri)) !== undefined;
 
 /** One timestamped line on the `tsv` Output channel (never revealed by this). */
 const log_line = (text: string): void => {
@@ -249,14 +260,17 @@ const log_line = (text: string): void => {
 };
 
 /**
- * One ignore file's read outcome — the CLI's three-way split. `absent` is silent
- * (nothing there, or deleted between the listing and the read); `unreadable` is a
- * present file whose rules cannot be applied (a read error, or invalid UTF-8), which
- * is warned rather than silently treated as absent; `content` is its text.
+ * One ignore file's read outcome, as the CLI grades it. `absent` is silent (nothing
+ * there, a directory of that name, or deleted between the listing and the read);
+ * `unreadable` is a present file whose rules cannot be applied (a read error, or invalid
+ * UTF-8), which is warned rather than silently treated as absent; `symlink` is a
+ * `.gitignore` that is a symbolic link, whose rules are not applied either and which is
+ * warned too (see `gitignore_presence`); `content` is its text.
  */
 type IgnoreRead =
 	| { kind: 'absent' }
 	| { kind: 'unreadable'; reason: string }
+	| { kind: 'symlink' }
 	| { kind: 'content'; content: string };
 
 /** Whether a `workspace.fs` failure means the file is not there at all. */
@@ -283,6 +297,53 @@ const read_ignore_file = async (uri: vscode.Uri): Promise<IgnoreRead> => {
 	}
 };
 
+/** How an ignore-file entry is present, by the CLI's rule for its name. */
+type IgnorePresence = 'absent' | 'file' | 'symlink';
+
+/** A name's presence rule, graded from the entry's `stat` type. */
+type IgnorePresenceRule = (type: vscode.FileType) => IgnorePresence;
+
+/**
+ * The tsv layer's presence rule (`is_ignore_file` on both CLIs): a regular file, reached
+ * through a symbolic link when the name is one, as prettier reads its own. A directory of
+ * that name holds no rules — reading it would fail and warn about rules that were never
+ * there — so it is absent, as is a link that resolves to no file.
+ */
+const tsv_layer_presence: IgnorePresenceRule = (type) =>
+	(type & vscode.FileType.File) !== 0 ? 'file' : 'absent';
+
+/**
+ * git's presence rule for `.gitignore` (`GitignorePresence` on both CLIs): git does not
+ * follow a symbolic link to one in a working tree and applies none of its rules, so a link
+ * is `symlink` whatever it points at — warned, its rules dropped — and anything else is
+ * graded as the tsv layer grades it.
+ */
+const gitignore_presence: IgnorePresenceRule = (type) =>
+	(type & vscode.FileType.SymbolicLink) !== 0 ? 'symlink' : tsv_layer_presence(type);
+
+/** An entry's read, given its presence: a present file's text (or why it could not be
+ * applied), otherwise the presence itself. */
+const read_by_presence = (uri: vscode.Uri, presence: IgnorePresence): Promise<IgnoreRead> =>
+	presence === 'file' ? read_ignore_file(uri) : Promise.resolve({ kind: presence });
+
+/**
+ * Read one listed ignore file, stat-ed and graded by its name's `presence` rule. The
+ * listing already found it, so only a not-found stat (the file deleted since) is absence;
+ * any other stat failure is left to the read, which reports it.
+ */
+const read_listed_ignore_file = async (
+	uri: vscode.Uri,
+	presence: IgnorePresenceRule
+): Promise<IgnoreRead> => {
+	let type: vscode.FileType;
+	try {
+		type = (await vscode.workspace.fs.stat(uri)).type;
+	} catch (err) {
+		return is_not_found(err) ? { kind: 'absent' } : read_ignore_file(uri);
+	}
+	return read_by_presence(uri, presence(type));
+};
+
 /**
  * The CLI's stderr line for a present-but-unreadable ignore file, restated by hand
  * (the two `tsv` bins template it themselves rather than taking it from the shared
@@ -291,6 +352,14 @@ const read_ignore_file = async (uri: vscode.Uri): Promise<IgnoreRead> => {
  */
 const unreadable_warning = (display_path: string, reason: string): string =>
 	`could not read ${display_path} (${reason}); its ignore rules are not applied`;
+
+/**
+ * The CLI's stderr line for a symlinked `.gitignore`, restated by hand: the shared matcher
+ * phrases it for both `tsv` bins (`tsv_discover::gitignore_symlink_warning`), but the
+ * pinned `@fuzdev/tsv_format_wasm` range predates that binding method.
+ */
+const gitignore_symlink_warning = (display_path: string): string =>
+	`${display_path} is a symbolic link, which git does not follow in a working tree; its ignore rules are not applied`;
 
 /**
  * One listing of every ignore file under `folder`, keyed by file name. The exclude is
@@ -337,21 +406,23 @@ const scan_ignore_files = async (
 
 /**
  * Every present ignore file of one name under `folder`, keyed by the directory holding
- * it — its text, or `unreadable` with the reason (an absent read, the file deleted
- * between the listing and the read, is dropped): the `listed` URIs read concurrently,
+ * it — its `IgnoreRead`, an absent one dropped: the `listed` URIs read concurrently,
  * plus the explicit folder-root read `**​/` can miss (inside a repo the root `.gitignore`
- * / `.prettierignore`, both regimes the root `.formatignore`). The root file is
- * usually NOT there, so its presence is a stat, never a read whose failure is
- * then classified: a provider that reports a missing file with a bare error (no
- * `FileNotFound` / `ENOENT` code) would otherwise turn every absent root file into a
- * present-but-unreadable one — three false warnings per reload, and a phantom
- * `.formatignore` shadowing a phantom `.prettierignore`. `is_not_found` stays as
- * the read's own answer for the listed files that vanish between listing and read.
+ * / `.prettierignore`, both regimes the root `.formatignore`). Every one is stat-ed
+ * before it is read and graded by `presence`, the name's rule, so a directory of that
+ * name is absent and a symlinked `.gitignore` is `symlink` in the listing and at the
+ * root alike. The root file is usually NOT there, so ANY failure of its stat is
+ * absence, never a read whose failure is then classified: a provider that reports a
+ * missing file with a bare error (no `FileNotFound` / `ENOENT` code) would otherwise
+ * turn every absent root file into a present-but-unreadable one — three false warnings
+ * per reload, and a phantom `.formatignore` shadowing a phantom `.prettierignore`.
+ * `is_not_found` stays the answer for a listed file that vanishes after the listing.
  */
 const collect_ignore_files = async (
 	folder: vscode.WorkspaceFolder,
 	name: string,
-	listed: vscode.Uri[]
+	listed: vscode.Uri[],
+	presence: IgnorePresenceRule
 ): Promise<Map<string, IgnoreRead>> => {
 	const root = folder.uri.path;
 	const files = new Map<string, IgnoreRead>();
@@ -359,7 +430,8 @@ const collect_ignore_files = async (
 	// in which a save still sees the previous state
 	const reads = await Promise.all(
 		listed.map(
-			async (uri) => [ignore_dir_rel(root, uri.path), await read_ignore_file(uri)] as const
+			async (uri) =>
+				[ignore_dir_rel(root, uri.path), await read_listed_ignore_file(uri, presence)] as const
 		)
 	);
 	for (const [dir, read] of reads) {
@@ -367,8 +439,9 @@ const collect_ignore_files = async (
 	}
 	if (!files.has('')) {
 		const root_uri = vscode.Uri.joinPath(folder.uri, name);
-		if (await path_exists(root_uri)) {
-			const root_read = await read_ignore_file(root_uri);
+		const type = await stat_type(root_uri);
+		if (type !== undefined) {
+			const root_read = await read_by_presence(root_uri, presence(type));
 			if (root_read.kind !== 'absent') files.set('', root_read);
 		}
 	}
@@ -377,10 +450,10 @@ const collect_ignore_files = async (
 
 /**
  * One name's reads as the texts to push (the layers), pushing the CLI's warning
- * line onto `warnings` for every unreadable one — an unreadable file's rules are
- * dropped, never silently treated as absent (on the CLI a `--check` reproducibility
- * hazard; here the difference between what a save touches and what `tsv format`
- * would). Presence is the reads map's own key set, so a caller that needs it (the
+ * line onto `warnings` for every file whose rules cannot be applied — an unreadable
+ * one, or a symlinked `.gitignore` git would not follow — so its rules are dropped,
+ * never silently treated as absent (on the CLI a `--check` reproducibility hazard;
+ * here the difference between what a save touches and what `tsv format` would). Presence is the reads map's own key set, so a caller that needs it (the
  * shadow) reads the keys, not this. The display path is folder-relative, like the
  * other hints'.
  */
@@ -394,10 +467,11 @@ const ignore_texts = (
 	for (const [dir, read] of reads) {
 		if (read.kind === 'content') {
 			texts.set(dir, read.content);
-		} else if (read.kind === 'unreadable') {
-			const display = dir === '' ? `${folder.name}/${name}` : `${folder.name}/${dir}/${name}`;
-			warnings.push(unreadable_warning(display, read.reason));
+			continue;
 		}
+		const display = dir === '' ? `${folder.name}/${name}` : `${folder.name}/${dir}/${name}`;
+		if (read.kind === 'unreadable') warnings.push(unreadable_warning(display, read.reason));
+		else if (read.kind === 'symlink') warnings.push(gitignore_symlink_warning(display));
 	}
 	return texts;
 };
@@ -445,24 +519,21 @@ const run_ignore_reload = async (
 
 	const [in_repo, listed] = await Promise.all([folder_is_repo(folder), scan_ignore_files(folder)]);
 	const none = new Map<string, IgnoreRead>();
-	const listed_for = (name: string): vscode.Uri[] => listed.get(name) ?? [];
+	const collect = (name: string, presence: IgnorePresenceRule) =>
+		collect_ignore_files(folder, name, listed.get(name) ?? [], presence);
 	// every read at once (off the save path, but shorter is a shorter stale window);
 	// `.gitignore` and `.prettierignore` are read inside a repo only — outside one the
 	// folder-root `.prettierignore`'s PRESENCE is still asked, for the hint
 	const [formatignore_reads, gitignore_reads, prettierignore_reads, root_prettierignore_present] =
 		await Promise.all([
-			collect_ignore_files(folder, formatignore_file_name, listed_for(formatignore_file_name)),
+			collect(formatignore_file_name, tsv_layer_presence),
+			in_repo ? collect(gitignore_file_name, gitignore_presence) : none,
+			in_repo ? collect(prettierignore_file_name, tsv_layer_presence) : none,
 			in_repo
-				? collect_ignore_files(folder, gitignore_file_name, listed_for(gitignore_file_name))
-				: none,
-			in_repo
-				? collect_ignore_files(
-						folder,
-						prettierignore_file_name,
-						listed_for(prettierignore_file_name)
+				? false
+				: stat_type(vscode.Uri.joinPath(folder.uri, prettierignore_file_name)).then(
+						(type) => type !== undefined && tsv_layer_presence(type) === 'file'
 					)
-				: none,
-			in_repo ? false : path_exists(vscode.Uri.joinPath(folder.uri, prettierignore_file_name))
 		]);
 	// a newer reload started while this one was reading: its reads are the later
 	// snapshot, so this one's result is dropped rather than raced onto the cache
@@ -476,7 +547,7 @@ const run_ignore_reload = async (
 	// error can't silently demote tsv's native file to prettier's)
 	const formatignore_present = new Set(formatignore_reads.keys());
 	const formatignores = ignore_texts(folder, formatignore_file_name, formatignore_reads, warnings);
-	// an unreadable `.gitignore` drops its rules AND leaves the build-output
+	// an unreadable or symlinked `.gitignore` drops its rules AND leaves the build-output
 	// heuristic on for its subtree (no anchor is pushed), as on the CLI
 	const gitignores = ignore_texts(folder, gitignore_file_name, gitignore_reads, warnings);
 	// which directories hold a `.prettierignore` at all — the shadow hint is keyed on
@@ -666,6 +737,9 @@ const tsv_layer_for_dir = (state: FolderIgnore, dir: string): string | undefined
  * (hierarchical `.gitignore` inside a repo + the hierarchical `.formatignore` /
  * `.prettierignore` tsv layers) or by the CLI's traversal pruning
  * (safety nets + build-output heuristic, via the shared `stack.is_path_pruned`).
+ * An open document is graded as a walk from the folder would reach it, not as a named
+ * CLI argument (which the ignore files alone bound): opening a file under
+ * `node_modules` or a build directory is not intent to reformat it on save.
  * Synchronous — reads only the prebuilt cache, assembling and freeing a per-call
  * `IgnoreStack`. Documents outside every workspace folder (loose/untitled) are
  * never ignored.

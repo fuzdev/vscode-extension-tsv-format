@@ -49,11 +49,23 @@ wrote) — follows the CLI too: its rules are dropped and the CLI's own line
 (`could not read <path> (<reason>); its ignore rules are not applied`, restated by hand
 from `cli.js` since the two `tsv` bins template it themselves) joins the hint set. An
 absent file stays silent (`FileSystemError.FileNotFound`, or `ENOENT` through a custom
-provider). Precedence is by **presence**, not readability: an unreadable
+provider), and so does a **directory** of that name: as on the CLI, a present ignore file
+is a regular file, reached through a link when the name is one — graded from its `stat`
+before any read, so a directory is never a false `could not read` line (nor, as a
+`.formatignore`, a phantom shadow). Precedence is by **presence**, not readability: an unreadable
 `.formatignore` still shadows its sibling `.prettierignore`, an unreadable `.gitignore`
 still leaves the build-output heuristic on for its subtree (no anchor is pushed), and
 a shadowed `.prettierignore` is never read at all, so it earns the shadow hint alone.
 This is what keeps a save touching the same files `tsv format` would.
+
+A **symlinked `.gitignore`** follows the CLI as well. git never reads a `.gitignore`
+through a symbolic link in a working tree (gitignore(5)), so neither `tsv` bin applies one,
+and neither does the extension: a listed or folder-root `.gitignore` whose `stat` carries
+the `SymbolicLink` bit is dropped like an unreadable one — no anchor, so the build-output
+heuristic stays on for its subtree — and the CLI's own line (`<path> is a symbolic link,
+which git does not follow in a working tree; its ignore rules are not applied`, restated by
+hand, since the pinned binding predates `gitignore_symlink_warning`) joins the hint set.
+`.formatignore` and `.prettierignore` keep reading through links, as prettier does.
 
 The **workspace folder is treated as the eval root** (the common case where it is
 the repo root). The CLI walks up to the `.git` repo root; the extension does not —
@@ -86,6 +98,17 @@ shared-policy seam it previously kept; it briefly used the per-directory
 `classify_dir` for this before `is_path_pruned` existed). The skip check is just
 `is_ignored(rel, false) || is_path_pruned(rel)`. (`classify_dir` stays the CLI's
 per-directory primitive for a real top-down walk; the extension has none.)
+
+**An open document is not a named path.** The CLI bounds a path an argument *names* by
+the ignore files alone — the safety nets and the build-output heuristic prune only what a
+walk discovers, so `tsv format node_modules/pkg/a.ts` formats — while the extension keeps
+the walk model: a save grades a document by the prunes a `tsv format <folder>` walk
+applies on the way down to it (by path, so a document under a symlinked directory, which
+that walk does not follow, still formats). Opening a file is not a statement of intent to format it (go-to-definition
+lands in `node_modules`, a stack trace in `dist`), and a save that rewrote a vendored or
+generated file wholesale would be a surprise; prettier-vscode skips `node_modules` for
+the same reason. The skip stays silent, as it is for an ignore-file match, so the CLI's
+excluded-argument warning has no counterpart here.
 
 One thing the CLI decides that the extension cannot: `tsv format` reads a path's own
 extension and parses `.mjs`/`.mts` as **modules with no script retry**, since those are ES
@@ -121,8 +144,11 @@ pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the r
   `**/.{gitignore,prettierignore,formatignore}` (events under a safety net are
   skipped — the listing drops them, so they can't change the state) plus the
   per-folder `.git` watcher, both installed before the initial load so nothing
-  written during it is missed. A reload reads every ignore file concurrently; the
-  folder-root files `**/` misses are stat-ed before they are read, so an absent one
+  written during it is missed. A reload reads every ignore file concurrently, each
+  stat-ed first and graded by its name's presence rule (`tsv_layer_presence` /
+  `gitignore_presence`: a directory of that name is absent, a symlinked `.gitignore`
+  is warned — one stat per listed file on top of its read); for the folder-root files
+  `**/` misses, any stat failure is absence, so an absent one
   is silent whatever error shape a virtual-FS provider uses for a missing file
   (classifying a bare error as "unreadable" would fabricate three warnings per
   reload and a phantom `.formatignore` shadow). A generation counter — one across

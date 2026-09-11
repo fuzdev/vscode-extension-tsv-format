@@ -112,7 +112,9 @@ const workspace = {
 	},
 	fs: {
 		async stat(uri) {
-			if (world.files.has(uri.path)) return { type: 1 };
+			// `FileType.File` is 1 and `Directory` 2; a link carries the `SymbolicLink` bit
+			// (64) beside its target's type, as VS Code's own stat does
+			if (world.files.has(uri.path)) return { type: world.symlinks?.has(uri.path) ? 1 | 64 : 1 };
 			if (world.dirs.has(uri.path)) return { type: 2 };
 			throw not_found(uri);
 		},
@@ -121,6 +123,13 @@ const workspace = {
 		// two ways an ignore file is present-but-unreadable
 		async readFile(uri) {
 			const content = world.files.get(uri.path);
+			// reading a directory fails as VS Code's does — `FileIsADirectory`, not a
+			// not-found — so a directory named like an ignore file must be caught before a read
+			if (content === undefined && world.dirs.has(uri.path)) {
+				throw Object.assign(new Error('EISDIR: illegal operation on a directory, read'), {
+					code: 'FileIsADirectory'
+				});
+			}
 			if (content === undefined) throw not_found(uri);
 			if (world.unreadable?.has(uri.path)) {
 				throw Object.assign(new Error(`EACCES: permission denied, open '${uri.path}'`), {
@@ -241,6 +250,8 @@ const languages = {
 
 module.exports = {
 	Uri,
+	// the `workspace.fs.stat` type bits the extension reads
+	FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
 	RelativePattern,
 	Range,
 	TextEdit,
