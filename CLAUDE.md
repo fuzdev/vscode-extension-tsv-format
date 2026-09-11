@@ -38,7 +38,11 @@ for them (a hint is information, not a failure, and must not steal focus from th
 parse-error indicator), and they are computed on a folder reload, never on the save
 path. The hint set is part of the folder's cached state and is logged only when it
 changes — the watcher fires on every ignore-file save, and an unread file is one line,
-not one per save; a set that shrinks to nothing is silence, not a line. The
+not one per save; a set that shrinks to nothing is silence, not a line. Hints are bounded
+to the directories `tsv format <folder>` descends into: the listing reads the ignore files
+inside a directory a rule or the build-output heuristic prunes too (harmless — a layer
+there changes no verdict), but the CLI's walk never does, so an unreadable or symlinked
+file, or a shadow, in one is not logged. The
 `heuristic_shadow_warning` hint is deliberately *not* surfaced — it reports
 a `.gitignore` turning the build-output heuristic off, which changes nothing the user
 configured.

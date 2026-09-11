@@ -106,8 +106,8 @@ const ignore_file_names = [gitignore_file_name, formatignore_file_name, prettier
 // CLI, so the listing drops them (see `scan_ignore_files`)
 const safety_net_dirs = new Set(['node_modules', '.git', '.sl', '.hg', '.svn', '.jj']);
 
-// The cached ignore state for one workspace folder, rebuilt off the save path.
-interface FolderIgnore {
+// The cached ignore layers for one workspace folder, rebuilt off the save path.
+interface FolderLayers {
 	// whether `<folder>/.git` exists — the CLI's two-regime switch. Inside a repo
 	// the extension honors `.gitignore` + hierarchical `.prettierignore`; outside
 	// one it honors only `.formatignore` (hierarchically), exactly like the CLI.
@@ -115,11 +115,12 @@ interface FolderIgnore {
 	// `.gitignore` text keyed by the directory holding it, relative to the folder
 	// root (`''` = the folder root). Populated only when `in_repo`. An unreadable or
 	// symlinked one (git does not follow a link) has no entry: its rules are dropped,
-	// warned in `hints`.
+	// warned in the folder's `hints`.
 	gitignores: Map<string, string>;
 	// `.formatignore` text keyed by directory (hierarchical, both regimes). A
 	// present-but-unreadable one (a read error, or invalid UTF-8 — reading is strict
-	// UTF-8, as on both CLIs) has no entry: its rules are dropped, warned in `hints`.
+	// UTF-8, as on both CLIs) has no entry: its rules are dropped, warned in the
+	// folder's `hints`.
 	formatignores: Map<string, string>;
 	// `.prettierignore` text keyed by directory (hierarchical, inside a repo only) —
 	// the UNSHADOWED ones only: a directory with a sibling `.formatignore` never has
@@ -127,12 +128,22 @@ interface FolderIgnore {
 	// `.formatignore`'s PRESENCE, not its readability, so a read error can't silently
 	// demote tsv's native file to prettier's. Empty outside a repo.
 	prettierignores: Map<string, string>;
-	// the heads-ups this state carries — the warnings for ignore files whose rules cannot
-	// be applied (unreadable, or a symlinked `.gitignore`) and the two
-	// `.prettierignore` hints (see `ignore_hints`) — kept so a reload that changes
-	// nothing re-logs nothing: the watcher fires on every ignore-file save, and the
-	// same unread file is one line, not one per save
+}
+
+// The cached ignore state for one workspace folder: its layers and the heads-ups they carry.
+interface FolderIgnore extends FolderLayers {
+	// the warnings for ignore files whose rules cannot be applied (unreadable, or a
+	// symlinked `.gitignore`) and the two `.prettierignore` hints (see `ignore_hints`) —
+	// kept so a reload that changes nothing re-logs nothing: the watcher fires on every
+	// ignore-file save, and the same unread file is one line, not one per save
 	hints: string[];
+}
+
+// A heads-up about the ignore files of one folder-relative directory (`''` = the root),
+// logged only where the CLI's walk reads them (see `ignore_hints`).
+interface DirHint {
+	dir: string;
+	text: string;
 }
 
 // gitignore-aware discovery: the prebuilt ignore state per workspace folder,
@@ -453,15 +464,15 @@ const collect_ignore_files = async (
  * line onto `warnings` for every file whose rules cannot be applied — an unreadable
  * one, or a symlinked `.gitignore` git would not follow — so its rules are dropped,
  * never silently treated as absent (on the CLI a `--check` reproducibility hazard;
- * here the difference between what a save touches and what `tsv format` would). Presence is the reads map's own key set, so a caller that needs it (the
- * shadow) reads the keys, not this. The display path is folder-relative, like the
- * other hints'.
+ * here the difference between what a save touches and what `tsv format` would).
+ * Presence is the reads map's own key set, so a caller that needs it (the shadow) reads
+ * the keys, not this. The display path is folder-relative, like the other hints'.
  */
 const ignore_texts = (
 	folder: vscode.WorkspaceFolder,
 	name: string,
 	reads: Map<string, IgnoreRead>,
-	warnings: string[]
+	warnings: DirHint[]
 ): Map<string, string> => {
 	const texts = new Map<string, string>();
 	for (const [dir, read] of reads) {
@@ -470,8 +481,11 @@ const ignore_texts = (
 			continue;
 		}
 		const display = dir === '' ? `${folder.name}/${name}` : `${folder.name}/${dir}/${name}`;
-		if (read.kind === 'unreadable') warnings.push(unreadable_warning(display, read.reason));
-		else if (read.kind === 'symlink') warnings.push(gitignore_symlink_warning(display));
+		if (read.kind === 'unreadable') {
+			warnings.push({ dir, text: unreadable_warning(display, read.reason) });
+		} else if (read.kind === 'symlink') {
+			warnings.push({ dir, text: gitignore_symlink_warning(display) });
+		}
 	}
 	return texts;
 };
@@ -541,7 +555,7 @@ const run_ignore_reload = async (
 
 	// the warnings an ignore file that cannot be applied earns (see `IgnoreRead`),
 	// gathered here and folded into the folder's hint set below
-	const warnings: string[] = [];
+	const warnings: DirHint[] = [];
 	// presence is the listing — an unreadable `.formatignore` is present, and it is
 	// presence that shadows a sibling `.prettierignore` (as on the CLI, so a read
 	// error can't silently demote tsv's native file to prettier's)
@@ -568,22 +582,17 @@ const run_ignore_reload = async (
 		warnings
 	);
 
+	const layers: FolderLayers = { in_repo, gitignores, formatignores, prettierignores };
 	const hints = ignore_hints(
 		IgnoreStack,
 		folder,
-		in_repo,
+		layers,
 		formatignore_present,
 		prettierignore_present,
 		warnings
 	);
 	const previous = folder_ignores.get(key);
-	folder_ignores.set(key, {
-		in_repo,
-		gitignores,
-		formatignores,
-		prettierignores,
-		hints
-	});
+	folder_ignores.set(key, { ...layers, hints });
 	// log the set only when it changed — a reload the watcher fires for an unrelated
 	// `.gitignore` save carries the same hints, and repeating them is noise; a set
 	// that shrank to nothing is silence, not a line (nothing is unread any more)
@@ -609,6 +618,12 @@ const same_lines = (a: string[], b: string[]): boolean =>
  *   shadowed by the sibling `.formatignore` — a present-but-unreadable
  *   `.formatignore` included.
  *
+ * Only the CLI's own: `tsv format <folder>` reads the ignore files of a directory only
+ * when it descends into one, so a hint about a directory its walk prunes — by a rule, or
+ * by the build-output heuristic — is dropped (`is_dir_walked`). The listing reads those
+ * files all the same, harmlessly, since a layer under a pruned directory changes no
+ * verdict.
+ *
  * Computed off the save path (a folder reload only) and logged by the caller to
  * the Output channel, which is not revealed — a hint is information, not a
  * failure, so it must not steal focus from the parse-error indicator.
@@ -618,40 +633,43 @@ const same_lines = (a: string[], b: string[]): boolean =>
 const ignore_hints = (
 	IgnoreStack: IgnoreStackCtor,
 	folder: vscode.WorkspaceFolder,
-	in_repo: boolean,
+	layers: FolderLayers,
 	formatignore_present: Set<string>,
 	prettierignore_present: Set<string>,
-	warnings: string[]
+	warnings: DirHint[]
 ): string[] => {
 	const hints = [...warnings];
 	const stack = new IgnoreStack();
 	try {
-		if (in_repo) {
+		if (layers.in_repo) {
 			// per directory: both files present means the tsv layer took the .formatignore
 			for (const dir of prettierignore_present) {
-				const hint = stack.prettierignore_shadowed_warning(
+				const text = stack.prettierignore_shadowed_warning(
 					dir === '' ? folder.name : `${folder.name}/${dir}`,
 					true,
 					true,
 					formatignore_present.has(dir)
 				);
-				if (hint !== undefined) hints.push(hint);
+				if (text !== undefined) hints.push({ dir, text });
 			}
 		} else {
 			// outside a repo no .prettierignore is read, so the folder-root file's
 			// presence is the one thing to ask about
-			const hint = stack.prettierignore_outside_repo_warning(
+			const text = stack.prettierignore_outside_repo_warning(
 				folder.name,
 				false,
 				prettierignore_present.has(''),
 				formatignore_present.has('')
 			);
-			if (hint !== undefined) hints.push(hint);
+			if (text !== undefined) hints.push({ dir: '', text });
 		}
 	} finally {
 		stack.free();
 	}
-	return hints.sort();
+	return hints
+		.filter(({ dir }) => is_dir_walked(IgnoreStack, layers, dir))
+		.map(({ text }) => text)
+		.sort();
 };
 
 const clear_ignore_folder = (key: string): void => {
@@ -729,8 +747,60 @@ const watch_folder_git = (folder: vscode.WorkspaceFolder): void => {
 /** The tsv-layer text for one directory: its `.formatignore`, or its
  * `.prettierignore` — which the reload stored only where no sibling `.formatignore`
  * is present (the per-directory shadow is applied at load, on presence). */
-const tsv_layer_for_dir = (state: FolderIgnore, dir: string): string | undefined =>
-	state.formatignores.get(dir) ?? state.prettierignores.get(dir);
+const tsv_layer_for_dir = (layers: FolderLayers, dir: string): string | undefined =>
+	layers.formatignores.get(dir) ?? layers.prettierignores.get(dir);
+
+/**
+ * Runs `f` over a stack holding the layers that govern `rel`, a folder-relative file
+ * path — its ancestor directories' `.gitignore` files (inside a repo) and tsv layers — and
+ * frees the stack however `f` returns. Synchronous: `layers` is the prebuilt cache.
+ */
+const with_ignore_stack = <T>(
+	IgnoreStack: IgnoreStackCtor,
+	layers: FolderLayers,
+	rel: string,
+	f: (stack: IgnoreStack) => T
+): T => {
+	const stack = new IgnoreStack();
+	try {
+		const dirs = ancestor_dirs(rel);
+		// `.gitignore` layers shallow→deep (repo only), then tsv layers shallow→deep;
+		// the matcher evaluates all gitignores before all tsv layers regardless of
+		// push interleaving, so a tsv `!` re-includes over `.gitignore`
+		if (layers.in_repo) {
+			for (const dir of dirs) {
+				const content = layers.gitignores.get(dir);
+				if (content !== undefined) stack.push_gitignore(dir, content);
+			}
+		}
+		for (const dir of dirs) {
+			const content = tsv_layer_for_dir(layers, dir);
+			// TODO: the binding past the pinned range replaces `push_tsv` with
+			// `push_formatignore` / `push_prettierignore` — on that range bump, push each map's
+			// text by its own kind (and retype `IgnoreStack`), so a layer names its file
+			if (content !== undefined) stack.push_tsv(dir, content);
+		}
+		return f(stack);
+	} finally {
+		stack.free();
+	}
+};
+
+/**
+ * Whether `tsv format <folder>` descends into `dir` (folder-relative, `''` = the root) and
+ * so reads its ignore files: no directory on the way down, `dir` itself included, is
+ * pruned — by a rule, a safety net or the build-output heuristic. Asked of a file directly
+ * inside `dir`, whose ancestor directories `is_path_pruned` grades.
+ */
+const is_dir_walked = (
+	IgnoreStack: IgnoreStackCtor,
+	layers: FolderLayers,
+	dir: string
+): boolean => {
+	if (dir === '') return true;
+	const rel = `${dir}/_`;
+	return !with_ignore_stack(IgnoreStack, layers, rel, (stack) => stack.is_path_pruned(rel));
+};
 
 /**
  * Whether the document is excluded by its workspace folder's ignore files
@@ -754,30 +824,15 @@ const is_document_ignored = (document: vscode.TextDocument): boolean => {
 	// *names* (dist/build/target/hidden), so it can apply even with zero ignore
 	// files — the full check below is cheap (an empty stack resolves fast).
 	const rel = folder_rel(folder.uri.path, document.uri.path);
-
-	const stack = new ignore_stack_ctor();
-	try {
-		const dirs = ancestor_dirs(rel);
-		// `.gitignore` layers shallow→deep (repo only), then tsv layers shallow→deep;
-		// the matcher evaluates all gitignores before all tsv layers regardless of
-		// push interleaving, so a tsv `!` re-includes over `.gitignore`
-		if (state.in_repo) {
-			for (const dir of dirs) {
-				const content = state.gitignores.get(dir);
-				if (content !== undefined) stack.push_gitignore(dir, content);
-			}
-		}
-		for (const dir of dirs) {
-			const content = tsv_layer_for_dir(state, dir);
-			if (content !== undefined) stack.push_tsv(dir, content);
-		}
-		// file-level match, then the shared per-file directory-prune walk (safety
-		// nets + build-output heuristic + matcher), which reconstructs the heuristic
-		// state from the stack's own `.gitignore` anchors — no walk hand-rolled here
-		return stack.is_ignored(rel, false) || stack.is_path_pruned(rel);
-	} finally {
-		stack.free();
-	}
+	// file-level match, then the shared per-file directory-prune walk (safety
+	// nets + build-output heuristic + matcher), which reconstructs the heuristic
+	// state from the stack's own `.gitignore` anchors — no walk hand-rolled here
+	return with_ignore_stack(
+		ignore_stack_ctor,
+		state,
+		rel,
+		(stack) => stack.is_ignored(rel, false) || stack.is_path_pruned(rel)
+	);
 };
 
 /**

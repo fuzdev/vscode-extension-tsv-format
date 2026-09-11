@@ -666,6 +666,56 @@ const main = async (): Promise<void> => {
 	);
 	expect_hints('hint: none outside a repo for a linked .gitignore or a .prettierignore dir', []);
 
+	// 10f. hints are the CLI's own: `tsv format <folder>` never descends into a directory a
+	//      rule excludes, so it never reads — nor warns about — the ignore files inside
+	//      one. The shadowed pair, the unreadable .gitignore and the symlinked one under
+	//      the gitignored vendor/ stay silent, while the same shadow in a walked directory
+	//      is reported
+	await run_scenario(
+		'hints: none for ignore files inside a directory a rule excludes',
+		{
+			'.gitignore': 'vendor/\n',
+			'vendor/.formatignore': 'a.ts\n',
+			'vendor/.prettierignore': '',
+			'vendor/sub/.gitignore': UNREADABLE,
+			'vendor/lnk/.gitignore': symlink_to('*\n'),
+			'vendor/a.ts': UNFORMATTED_TS,
+			'ok/.formatignore': '',
+			'ok/.prettierignore': '',
+			'ok/a.ts': UNFORMATTED_TS
+		},
+		true,
+		[
+			['vendor/a.ts', 'typescript', true],
+			['ok/a.ts', 'typescript', false]
+		]
+	);
+	expect_hints("hint: only the walked directory's shadow", [shadow_hint('repo/ok')]);
+
+	// 10g. the same for a directory the build-output heuristic prunes (no .gitignore in
+	//      scope, so it is on): dist/ and a hidden directory keep their ignore files'
+	//      trouble to themselves, while an unreadable .formatignore in a walked directory
+	//      is warned
+	await run_scenario(
+		'hints: none for ignore files inside a directory the heuristic prunes',
+		{
+			'dist/.formatignore': '',
+			'dist/.prettierignore': '',
+			'.cache/.formatignore': UNREADABLE,
+			'src/.formatignore': UNREADABLE,
+			'src/a.ts': UNFORMATTED_TS,
+			'dist/out.ts': UNFORMATTED_TS
+		},
+		true,
+		[
+			['src/a.ts', 'typescript', false],
+			['dist/out.ts', 'typescript', true]
+		]
+	);
+	expect_hints("hint: only the walked directory's unreadable file", [
+		unreadable_hint('repo/src/.formatignore', permission_reason('src/.formatignore'))
+	]);
+
 	// 11. the `.git` watcher flips the regime: `git init` in an open loose folder
 	//     starts honoring .prettierignore and retires the outside-repo hint (a set
 	//     that shrank to nothing is silence); removing .git reverses it and the hint
