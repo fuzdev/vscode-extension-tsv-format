@@ -24,7 +24,7 @@ export interface TsvFormatters {
  * (the extension dispatches by `languageId`, not by extension, so it never needs
  * that helper's filter), `classify_dir` (the per-directory verdict for a top-down
  * *traverser*; the extension has no traversal and uses the per-file `is_path_pruned`
- * instead), and `heuristic_shadow_warning`. That hint names a real misconfiguration: a
+ * instead), and `shadow_warning`. That hint names a real misconfiguration: a
  * tsv-layer `!` re-include written under a directory the build-output heuristic prunes
  * (`!dist/keep.ts`) does nothing, since git's parent-directory rule bars a re-include
  * inside an excluded directory. The CLI raises it from its walk, at the pruned
@@ -959,7 +959,7 @@ const format_document = (
 	// honor .gitignore / .formatignore / .prettierignore on save (and explicit
 	// Format Document — VSCode routes both through this provider with no way to
 	// tell them apart, so both skip an ignored file, matching prettier-vscode)
-	// TODO: once the pinned range carries it, log `path_heuristic_shadow_warning(rel,
+	// TODO: once the pinned range carries it, log `path_shadow_warning(rel,
 	// loose_root)` when `is_path_pruned` skips a save, deduped per folder reload
 	if (is_document_ignored(document)) {
 		// a skipped document is not formatted at all, so a parse-error indicator it left

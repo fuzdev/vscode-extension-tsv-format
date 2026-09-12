@@ -43,14 +43,14 @@ to the directories `tsv format <folder>` descends into: the listing reads the ig
 inside a directory a rule or the build-output heuristic prunes too (harmless — a layer
 there changes no verdict), but the CLI's walk never does, so an unreadable or symlinked
 file, or a shadow, in one is not logged. The
-`heuristic_shadow_warning` hint is *not* surfaced, though it names a real
+`shadow_warning` hint is *not* surfaced, though it names a real
 misconfiguration: a tsv-layer `!` re-include written under a directory the build-output
 heuristic prunes (`!dist/keep.ts` in a loose folder's `.formatignore`) does nothing, since
 git's parent-directory rule bars a re-include inside an excluded directory. The CLI raises
 it from its walk, at the pruned directory, pointing at the directory-level re-include that
 works; the extension has no walk to raise it from, so a save of such a file is skipped
 silently. The binding past the pinned range answers it per file
-(`path_heuristic_shadow_warning(rel, loose_root?)`), so logging it on a skipped save waits
+(`path_shadow_warning(rel, loose_root?)`), so logging it on a skipped save waits
 on the range bump.
 
 An ignore file that is **present but unreadable** — a read error, or invalid UTF-8
