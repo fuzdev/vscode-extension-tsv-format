@@ -327,12 +327,60 @@ dependency at install time. Two consequences:
   run check`, then re-`package`/publish. There is no runtime auto-update of the
   formatter — its version is frozen into each `.vsix`.
 
-Publish flow (maintainer-owned): `npm run check` → bump `version` → `npm run
-package` (or `vsce publish`) for the Marketplace → `ovsx publish` for Open VSX.
-Keep the published WASM in sync across both registries. The `engines.vscode`
-floor (`^1.90.0`) and `@types/vscode` track the **minimum** supported host, not
-latest; raise both together only when a newer host API is actually needed.
+The `engines.vscode` floor (`^1.90.0`) and `@types/vscode` track the **minimum**
+supported host, not latest; raise both together only when a newer host API is
+actually needed.
 
-**Pre-publish checklist** (live confirmation, can't be driven headlessly):
-desktop **multi-root** + the **web** host (vscode.dev / github.dev) — F5 via
-`.vscode/launch.json` ("Run Extension (Desktop)" / "(Web)").
+**What ships** is only `package.json`, `readme.md`, `LICENSE`, `icon.png` and
+`dist/{node,web}/` — `.vscodeignore` keeps the rest out, including `AGENTS.md`
+(a symlink to this file, so excluding `CLAUDE.md` alone doesn't cover it),
+`.claude/**` and `*.local*`. `vsce package` prints the file tree; check it after
+adding any top-level file.
+
+**Publish flow** (maintainer-owned — the version bump and both uploads):
+
+1. **Pre-publish checklist** (live confirmation, can't be driven headlessly), below.
+2. Bump `version` in `package.json` and commit, so the `.vsix` builds from a
+   committed tree.
+3. `npm ci` (the provenance go/no-go above) → `npm run check` → `npm run
+   package`, which writes `tsv-format-<version>.vsix` to the repo root. `*.vsix`
+   is gitignored, so keep a copy outside the repo.
+4. Upload **that `.vsix`** to the VSCode Marketplace (the publisher management
+   page, or `npx @vscode/vsce publish --packagePath <file>`).
+5. Publish **the same `.vsix`** to Open VSX: `npx ovsx publish <file> -p <token>`.
+   Always pass the file — a bare `ovsx publish` repackages from the working tree,
+   and the two registries could then ship different bytes.
+6. Tag the release commit (`v<version>`).
+
+Open VSX can lag the Marketplace (the registries are independent; nothing in the
+extension or build references either) — publish the kept `.vsix` when ready, or
+rebuild it from the tag with `npm ci`, which pins the same WASM.
+
+**Open VSX one-time setup**: sign in to open-vsx.org with GitHub, link an Eclipse
+Foundation account and sign the Publisher Agreement in the profile settings,
+create an access token there, then `npx ovsx create-namespace fuzdev -p <token>`.
+Namespaces are first-come; claim ownership (an issue on the open-vsx.org GitHub
+repo) to get the verified mark.
+
+**Pre-publish checklist** — F5 via `.vscode/launch.json`:
+
+- **Desktop multi-root** ("Run Extension (Desktop)") — a workspace of several
+  repos: files format, ignored files are skipped.
+- **Web host** ("Run Extension (Web)") — runs the `browser` bundle in a Web
+  Worker, the path the desktop run never touches (the `.wasm` read through
+  `workspace.fs` + async `init`). Confirm under **Developer: Show Running
+  Extensions** that the extension sits in the **Web Worker** host. Check: ts /
+  svelte / css / `.mjs` format, an ignored file is skipped, a syntax error shows
+  the `⚠ tsv` status item and clears once fixed; optionally, a nesting-overflow
+  input (`node -e "console.log('x = ' + '['.repeat(200000) + ']'.repeat(200000))"`)
+  reports an engine error and the next format still works.
+- Launch notes: the `npm: watch` preLaunchTask never exits and has no problem
+  matcher (no `tasks.json`) — if the launch waits on it, `npm run build` first
+  and "Debug Anyway". Uninstall any `.vsix` copy
+  of the extension (or add `--disable-extensions` to `args`) so it's unambiguous
+  which copy runs, and so no other formatter (Prettier) claims the default.
+- Optionally, a real browser over a virtual FS, closer to vscode.dev:
+  `npx @vscode/test-web --browserType=none --extensionDevelopmentPath=. <folder>`,
+  then open `http://localhost:3000`. If `findFiles` is unsupported there, the tsv
+  Output channel logs it and formatting continues on the folder-root ignore files
+  plus the always-on pruning.
