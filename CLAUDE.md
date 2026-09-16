@@ -259,7 +259,7 @@ check has already freed its own before the formatter runs.
   `reinstantiate`, whose synchronous re-init the web host's Worker allows (a browser
   main thread would not).
 - `esbuild.js` — dual CJS build; copies `tsv_wasm_bg.wasm` next to each bundle.
-- `icon.png` — 128×128 marketplace icon (`package.json` `icon`); shipped in the
+- `icon.png` — 256×256 marketplace icon (`package.json` `icon`); shipped in the
   `.vsix` (not excluded by `.vscodeignore`).
 
 ## Manifest shape
