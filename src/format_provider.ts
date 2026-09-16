@@ -1,13 +1,28 @@
 import * as vscode from 'vscode';
 
 /**
- * The three `string -> string` formatters exported by `@fuzdev/tsv_format_wasm`.
- * Both extension hosts supply the same functions — only WASM init timing differs.
+ * The `@fuzdev/tsv_format_wasm` surface the provider runs on: the three
+ * `string -> string` formatters plus the engine's trap-recovery hook. Both extension
+ * hosts supply the same functions — only WASM init timing differs.
+ *
+ * `format_typescript` takes the parse goal a path's extension settles
+ * (`source_type_for_document`); the other two reject the key — Svelte's `<script>` is
+ * always a module and CSS has no goal — so they are typed without it.
  */
-export interface TsvFormatters {
-	format_typescript: (source: string) => string;
+export interface TsvEngine {
+	format_typescript: (source: string, options?: { sourceType?: 'module' }) => string;
 	format_css: (source: string) => string;
 	format_svelte: (source: string) => string;
+	/**
+	 * Discard a poisoned WASM instance and initialize a fresh one from the
+	 * already-compiled module (never a recompile). A stack overflow — input nested past
+	 * the module's ~1 MiB shadow stack, which generated and minified code can reach —
+	 * traps and leaves `__stack_pointer` where the deep call left it, so every later
+	 * call throws `memory access out of bounds`: without this, one such document breaks
+	 * format-on-save for the rest of the window. `tsv format` recovers the same way,
+	 * between files (`cli.js` `recover_engine_suffix`).
+	 */
+	reinstantiate: () => void;
 }
 
 /**
@@ -20,23 +35,25 @@ export interface TsvFormatters {
  *
  * Only the members the extension uses are typed here. The stack is built and
  * freed per document (never unwound while traversing), so the package's
- * `pop_gitignore` / `pop_tsv` are omitted — as are `is_empty`, `should_format_file`
- * (the extension dispatches by `languageId`, not by extension, so it never needs
- * that helper's filter), `classify_dir` (the per-directory verdict for a top-down
- * *traverser*; the extension has no traversal and uses the per-file `is_path_pruned`
- * instead), and `shadow_warning`. That hint names a real misconfiguration: a
- * tsv-layer `!` re-include written under a directory the build-output heuristic prunes
- * (`!dist/keep.ts`) does nothing, since git's parent-directory rule bars a re-include
- * inside an excluded directory. The CLI raises it from its walk, at the pruned
- * directory; the extension has no walk, so such a file is skipped silently. The two
- * **`.prettierignore`** hints are typed and used:
- * each names an ignore file whose rules go unread, which is a silent
- * misconfiguration rather than a pruning detail, so `report_ignore_hints` logs them
- * to the Output channel exactly as the CLI writes them to stderr.
+ * `pop_gitignore` / `pop_tsv` are omitted — as are `should_format_file` (the
+ * extension dispatches by `languageId`, not by extension, so it never needs that
+ * helper's filter), `classify_dir` and `shadow_warning` (the per-directory verdict
+ * and warning for a top-down *traverser*; the extension has no traversal and uses
+ * their per-file companions `is_path_pruned` / `path_shadow_warning` instead), and
+ * the three an argument list earns — `excluded_argument_warning`,
+ * `unsupported_extension_error`, `unresolvable_root_error` — which no open document
+ * can: a document is graded as a walk reaches it, never as a named path.
  */
 export interface IgnoreStack {
 	push_gitignore(anchor: string, content: string): void;
-	push_tsv(anchor: string, content: string): void;
+	/** Push one directory's `.formatignore` as a tsv layer, applied after every
+	 * `.gitignore`. Pushed by its own kind, not as a nameless tsv layer, so a warning
+	 * the stack phrases (`path_shadow_warning`) names the file the rule was written in. */
+	push_formatignore(anchor: string, content: string): void;
+	/** Push one directory's `.prettierignore` as a tsv layer — the file read, inside a
+	 * repo, where no sibling `.formatignore` shadows it. Matched exactly as a
+	 * `.formatignore` layer is; what differs is the file a warning names. */
+	push_prettierignore(anchor: string, content: string): void;
 	is_ignored(path: string, is_dir: boolean): boolean;
 	/**
 	 * Whether `rel` (a folder-root-relative file path) is skipped because some
@@ -51,6 +68,22 @@ export interface IgnoreStack {
 	 * `is_ignored(rel, false)` for the file-level match.
 	 */
 	is_path_pruned(rel: string): boolean;
+	/**
+	 * The warning a walk raises on the way down to `rel`: `shadow_warning`'s text for
+	 * the first ancestor directory `is_path_pruned` stops at, when that directory was
+	 * pruned — by the build-output heuristic or by an ignore rule — under a tsv-layer
+	 * `!` re-include, which git's parent-directory rule makes a silent no-op;
+	 * `undefined` otherwise (a safety net stays quiet, as it does on a walk). The
+	 * per-file companion to the CLI's per-directory `classify_dir` + `shadow_warning`.
+	 * `loose_root` is the format root's display path outside a git repo.
+	 */
+	path_shadow_warning(rel: string, loose_root?: string): string | undefined;
+	/**
+	 * The CLI's line for an in-tree `.gitignore` that is a symbolic link — which git
+	 * does not follow in a working tree, so none of its rules apply. The receiver is
+	 * unused, as it is for the two hints below.
+	 */
+	gitignore_symlink_warning(path: string): string;
 	/**
 	 * The heads-up text for a `.prettierignore` at a target root **outside** a git
 	 * repo, where tsv reads only `.formatignore` and those rules therefore go unread;
@@ -80,10 +113,13 @@ export interface IgnoreStack {
 /** The `IgnoreStack` class constructor (`new IgnoreStack()`). */
 export type IgnoreStackCtor = new () => IgnoreStack;
 
+/** The engine's three formatters, as dispatch keys. */
+type FormatterKey = 'format_typescript' | 'format_css' | 'format_svelte';
+
 // VSCode `languageId` -> tsv formatter. ONLY these four are safe: tsv cannot
 // format json/jsonc, html, jsx/tsx (typescriptreact/javascriptreact), or
 // scss/less/postcss, so those language ids must never be registered or dispatched.
-const formatter_keys_by_language: Record<string, keyof TsvFormatters> = {
+const formatter_keys_by_language: Record<string, FormatterKey> = {
 	typescript: 'format_typescript',
 	javascript: 'format_typescript',
 	svelte: 'format_svelte',
@@ -140,6 +176,11 @@ interface FolderIgnore extends FolderLayers {
 	// kept so a reload that changes nothing re-logs nothing: the watcher fires on every
 	// ignore-file save, and the same unread file is one line, not one per save
 	hints: string[];
+	// the shadow warnings already logged against these layers (see `report_shadow_hint`).
+	// Unlike `hints` these are raised on the save path, one directory at a time, so the
+	// set is filled as saves arrive and cannot be recomputed and compared at reload;
+	// a reload that read the same bytes carries it forward instead (`same_layers`)
+	shadow_logged: Set<string>;
 }
 
 // A heads-up about the ignore files of one folder-relative directory (`''` = the root),
@@ -268,6 +309,20 @@ const stat_type = async (uri: vscode.Uri): Promise<vscode.FileType | undefined> 
 const path_exists = async (uri: vscode.Uri): Promise<boolean> =>
 	(await stat_type(uri)) !== undefined;
 
+/**
+ * Run `f` over an empty `IgnoreStack` and free it. The stack is the receiver the
+ * package's warning texts ride on (each ignores it), so this is how the extension
+ * reaches a line the shared matcher phrases rather than templating one here.
+ */
+const with_warning_stack = <T>(IgnoreStack: IgnoreStackCtor, f: (stack: IgnoreStack) => T): T => {
+	const stack = new IgnoreStack();
+	try {
+		return f(stack);
+	} finally {
+		stack.free();
+	}
+};
+
 /** One timestamped line on the `tsv` Output channel (never revealed by this). */
 const log_line = (text: string): void => {
 	output_channel?.appendLine(`[${new Date().toISOString()}] ${text}`);
@@ -366,14 +421,6 @@ const read_listed_ignore_file = async (
  */
 const unreadable_warning = (display_path: string, reason: string): string =>
 	`could not read ${display_path} (${reason}); its ignore rules are not applied`;
-
-/**
- * The CLI's stderr line for a symlinked `.gitignore`, restated by hand: the shared matcher
- * phrases it for both `tsv` bins (`tsv_discover::gitignore_symlink_warning`), but the
- * pinned `@fuzdev/tsv_format_wasm` range predates that binding method.
- */
-const gitignore_symlink_warning = (display_path: string): string =>
-	`${display_path} is a symbolic link, which git does not follow in a working tree; its ignore rules are not applied`;
 
 /**
  * One listing of every ignore file under `folder`, keyed by file name. The exclude is
@@ -479,6 +526,7 @@ const collect_ignore_files = async (
  * the keys, not this. The display path is folder-relative, like the other hints'.
  */
 const ignore_texts = (
+	IgnoreStack: IgnoreStackCtor,
 	folder: vscode.WorkspaceFolder,
 	name: string,
 	reads: Map<string, IgnoreRead>,
@@ -494,7 +542,12 @@ const ignore_texts = (
 		if (read.kind === 'unreadable') {
 			warnings.push({ dir, text: unreadable_warning(display, read.reason) });
 		} else if (read.kind === 'symlink') {
-			warnings.push({ dir, text: gitignore_symlink_warning(display) });
+			// a stack per symlinked `.gitignore` — near-always none, and the text is the
+			// shared matcher's own rather than one restated here
+			warnings.push({
+				dir,
+				text: with_warning_stack(IgnoreStack, (stack) => stack.gitignore_symlink_warning(display))
+			});
 		}
 	}
 	return texts;
@@ -570,10 +623,22 @@ const run_ignore_reload = async (
 	// presence that shadows a sibling `.prettierignore` (as on the CLI, so a read
 	// error can't silently demote tsv's native file to prettier's)
 	const formatignore_present = new Set(formatignore_reads.keys());
-	const formatignores = ignore_texts(folder, formatignore_file_name, formatignore_reads, warnings);
+	const formatignores = ignore_texts(
+		IgnoreStack,
+		folder,
+		formatignore_file_name,
+		formatignore_reads,
+		warnings
+	);
 	// an unreadable or symlinked `.gitignore` drops its rules AND leaves the build-output
 	// heuristic on for its subtree (no anchor is pushed), as on the CLI
-	const gitignores = ignore_texts(folder, gitignore_file_name, gitignore_reads, warnings);
+	const gitignores = ignore_texts(
+		IgnoreStack,
+		folder,
+		gitignore_file_name,
+		gitignore_reads,
+		warnings
+	);
 	// which directories hold a `.prettierignore` at all — the shadow hint is keyed on
 	// presence (a shadowed one is never read, so it can earn no read warning), and
 	// outside a repo none is read, but the folder-root one's presence is exactly what
@@ -586,6 +651,7 @@ const run_ignore_reload = async (
 	// presence alone reported by the shadow hint
 	for (const dir of formatignore_present) prettierignore_reads.delete(dir);
 	const prettierignores = ignore_texts(
+		IgnoreStack,
 		folder,
 		prettierignore_file_name,
 		prettierignore_reads,
@@ -602,7 +668,12 @@ const run_ignore_reload = async (
 		warnings
 	);
 	const previous = folder_ignores.get(key);
-	folder_ignores.set(key, { ...layers, hints });
+	folder_ignores.set(key, {
+		...layers,
+		hints,
+		shadow_logged:
+			previous !== undefined && same_layers(previous, layers) ? previous.shadow_logged : new Set()
+	});
 	// log the set only when it changed — a reload the watcher fires for an unrelated
 	// `.gitignore` save carries the same hints, and repeating them is noise; a set
 	// that shrank to nothing is silence, not a line (nothing is unread any more)
@@ -613,6 +684,24 @@ const run_ignore_reload = async (
 
 const same_lines = (a: string[], b: string[]): boolean =>
 	a.length === b.length && a.every((line, i) => line === b[i]);
+
+const same_texts = (a: Map<string, string>, b: Map<string, string>): boolean =>
+	a.size === b.size && [...a].every(([dir, text]) => b.get(dir) === text);
+
+/**
+ * Whether two snapshots hold the same ignore layers — the regime flag and the three
+ * texts-by-directory maps. A reload fires on every ignore-file save anywhere in the
+ * folder, so most read back exactly what was there; one that did keeps the shadow
+ * warnings already logged, which is the closest a save-driven set can come to the hint
+ * set's "log it only when it changed". A reload whose layers really moved starts over:
+ * the edit may be the one that resolved the misconfiguration, and if it wasn't, saying
+ * so again against the new rules is the same courtesy the hint set gets.
+ */
+const same_layers = (a: FolderLayers, b: FolderLayers): boolean =>
+	a.in_repo === b.in_repo &&
+	same_texts(a.gitignores, b.gitignores) &&
+	same_texts(a.formatignores, b.formatignores) &&
+	same_texts(a.prettierignores, b.prettierignores);
 
 /**
  * The heads-ups tsv's CLI writes to stderr, as one sorted list: the read warnings
@@ -648,9 +737,8 @@ const ignore_hints = (
 	prettierignore_present: Set<string>,
 	warnings: DirHint[]
 ): string[] => {
-	const hints = [...warnings];
-	const stack = new IgnoreStack();
-	try {
+	const hints = with_warning_stack(IgnoreStack, (stack) => {
+		const dir_hints = [...warnings];
 		if (layers.in_repo) {
 			// per directory: both files present means the tsv layer took the .formatignore
 			for (const dir of prettierignore_present) {
@@ -660,7 +748,7 @@ const ignore_hints = (
 					true,
 					formatignore_present.has(dir)
 				);
-				if (text !== undefined) hints.push({ dir, text });
+				if (text !== undefined) dir_hints.push({ dir, text });
 			}
 		} else {
 			// outside a repo no .prettierignore is read, so the folder-root file's
@@ -671,11 +759,10 @@ const ignore_hints = (
 				prettierignore_present.has(''),
 				formatignore_present.has('')
 			);
-			if (text !== undefined) hints.push({ dir: '', text });
+			if (text !== undefined) dir_hints.push({ dir: '', text });
 		}
-	} finally {
-		stack.free();
-	}
+		return dir_hints;
+	});
 	return hints
 		.filter(({ dir }) => is_dir_walked(IgnoreStack, layers, dir))
 		.map(({ text }) => text)
@@ -754,12 +841,6 @@ const watch_folder_git = (folder: vscode.WorkspaceFolder): void => {
 	});
 };
 
-/** The tsv-layer text for one directory: its `.formatignore`, or its
- * `.prettierignore` — which the reload stored only where no sibling `.formatignore`
- * is present (the per-directory shadow is applied at load, on presence). */
-const tsv_layer_for_dir = (layers: FolderLayers, dir: string): string | undefined =>
-	layers.formatignores.get(dir) ?? layers.prettierignores.get(dir);
-
 /**
  * Runs `f` over a stack holding the layers that govern `rel`, a folder-relative file
  * path — its ancestor directories' `.gitignore` files (inside a repo) and tsv layers — and
@@ -783,12 +864,19 @@ const with_ignore_stack = <T>(
 				if (content !== undefined) stack.push_gitignore(dir, content);
 			}
 		}
+		// each tsv layer by its own kind — `.formatignore`, or the `.prettierignore` the
+		// reload stored only where no sibling `.formatignore` is present (the
+		// per-directory shadow is applied at load, on presence). The two match
+		// identically; the kind is what a warning the stack phrases names as the file a
+		// rule was written in (`path_shadow_warning`)
 		for (const dir of dirs) {
-			const content = tsv_layer_for_dir(layers, dir);
-			// TODO: the binding past the pinned range replaces `push_tsv` with
-			// `push_formatignore` / `push_prettierignore` — on that range bump, push each map's
-			// text by its own kind (and retype `IgnoreStack`), so a layer names its file
-			if (content !== undefined) stack.push_tsv(dir, content);
+			const formatignore = layers.formatignores.get(dir);
+			if (formatignore !== undefined) {
+				stack.push_formatignore(dir, formatignore);
+				continue;
+			}
+			const prettierignore = layers.prettierignores.get(dir);
+			if (prettierignore !== undefined) stack.push_prettierignore(dir, prettierignore);
 		}
 		return f(stack);
 	} finally {
@@ -813,6 +901,33 @@ const is_dir_walked = (
 };
 
 /**
+ * Log the shadow warning for a save a directory prune skipped, when a tsv-layer `!`
+ * re-include written under that directory was trying to reach it — and doing nothing,
+ * by git's parent-directory rule. The CLI raises this from its walk, at the pruned
+ * directory; the extension has no walk, so the per-file `path_shadow_warning` answers
+ * it here, phrased by the shared matcher and never templated. `loose_root` is the
+ * folder's display path, as every other line the channel carries names its files
+ * (`ignore_hints`), so the whole log reads one way in a multi-root workspace.
+ *
+ * Deduped per snapshot: the text names the pruned directory, so one misconfigured
+ * directory is one line however many of its files are saved, and a folder reload — which
+ * may have read the file that resolves it — starts the set over.
+ *
+ * @mutates state.shadow_logged
+ */
+const report_shadow_hint = (
+	stack: IgnoreStack,
+	folder: vscode.WorkspaceFolder,
+	state: FolderIgnore,
+	rel: string
+): void => {
+	const text = stack.path_shadow_warning(rel, folder.name);
+	if (text === undefined || state.shadow_logged.has(text)) return;
+	state.shadow_logged.add(text);
+	log_line(text);
+};
+
+/**
  * Whether the document is excluded by its workspace folder's ignore files
  * (hierarchical `.gitignore` inside a repo + the hierarchical `.formatignore` /
  * `.prettierignore` tsv layers) or by the CLI's traversal pruning
@@ -834,15 +949,17 @@ const is_document_ignored = (document: vscode.TextDocument): boolean => {
 	// *names* (dist/build/target/hidden), so it can apply even with zero ignore
 	// files — the full check below is cheap (an empty stack resolves fast).
 	const rel = folder_rel(folder.uri.path, document.uri.path);
-	// file-level match, then the shared per-file directory-prune walk (safety
-	// nets + build-output heuristic + matcher), which reconstructs the heuristic
-	// state from the stack's own `.gitignore` anchors — no walk hand-rolled here
-	return with_ignore_stack(
-		ignore_stack_ctor,
-		state,
-		rel,
-		(stack) => stack.is_ignored(rel, false) || stack.is_path_pruned(rel)
-	);
+	// the shared per-file directory-prune walk first, as a traversal meets it (safety
+	// nets + build-output heuristic + matcher, reconstructing the heuristic state from
+	// the stack's own `.gitignore` anchors — no walk hand-rolled here), then the
+	// file-level match. Asked in that order and unconditionally, so a prune under a
+	// dead `!` re-include is reported even for a file a rule also excludes — the walk
+	// raising it never reaches the file either way
+	return with_ignore_stack(ignore_stack_ctor, state, rel, (stack) => {
+		const pruned = stack.is_path_pruned(rel);
+		if (pruned) report_shadow_hint(stack, folder, state, rel);
+		return pruned || stack.is_ignored(rel, false);
+	});
 };
 
 /**
@@ -902,33 +1019,125 @@ const to_error_message = (value: unknown): string =>
 	value instanceof Error ? value.message : String(value);
 
 /**
+ * Whether `name`'s extension is `ext`, ignoring ASCII case — read as both `tsv` bins
+ * read one (`cli.js`'s `has_extension_ignoring_case`, natively `Path::extension`): off
+ * the final path component, so a bare dotfile (`.mjs`) is a stem with no extension, and
+ * lowercased, so `A.MJS` is the same kind of file as `a.mjs`. Either separator, since a
+ * document's `fileName` is the host's own (`\` on Windows).
+ */
+const has_extension = (name: string, ext: string): boolean => {
+	const base = name.slice(Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\')) + 1);
+	return (
+		base.length > ext.length + 1 &&
+		base[base.length - ext.length - 1] === '.' &&
+		base.slice(-ext.length).toLowerCase() === ext
+	);
+};
+
+/**
+ * The parse goal a document's own extension settles, or `undefined` where it settles
+ * none — restated by hand from `tsv_ts::Goal::from_extension`, as `cli.js` restates it,
+ * so a document formats under the grammar `tsv format` would give its path.
+ *
+ * `.mjs` and `.mts` are ES modules whatever any config says, so the module-then-script
+ * fallback has nothing to fall back to there: it exists to reach a legacy sloppy script
+ * (a `with` statement, a leading-zero literal), which a file that is a module by name
+ * cannot be. Every other extension stays `undefined` and takes the fallback. No source
+ * the module grammar accepts is affected — the retry fires only on a module parse
+ * failure, and the printer never reads the goal.
+ */
+const source_type_for_document = (document: vscode.TextDocument): 'module' | undefined =>
+	has_extension(document.fileName, 'mjs') || has_extension(document.fileName, 'mts')
+		? 'module'
+		: undefined;
+
+/**
  * Resolves the tsv formatter for a document, dispatching on `languageId` and
- * falling back to the `.svelte` file extension. The extension contributes the
+ * falling back to the `.svelte` file extension, read as `parser_from_extension` reads
+ * one (so `weird.SVELTE` dispatches and a bare `.svelte` dotfile does not, as on the
+ * CLI). The extension contributes the
  * `.svelte` → `svelte` language association itself (`package.json`
  * `contributes.languages`), so a `.svelte` file carries the `svelte` languageId
  * — and fires `onLanguage:svelte` — with or without the Svelte extension
  * installed; the fileName fallback is now defensive only (e.g. a `.svelte`
  * document forced to some other id). ts/js/css ids are built into VSCode.
+ *
+ * The TypeScript formatter carries the document's parse goal; the other two reject
+ * the key, and `undefined` reads as the default — the same split `cli.js` makes.
  */
 const formatter_for_document = (
 	document: vscode.TextDocument,
-	formatters: TsvFormatters
+	engine: TsvEngine
 ): ((source: string) => string) | undefined => {
 	const key =
 		formatter_keys_by_language[document.languageId] ??
-		(document.fileName.endsWith('.svelte') ? 'format_svelte' : undefined);
-	return key ? formatters[key] : undefined;
+		(has_extension(document.fileName, 'svelte') ? 'format_svelte' : undefined);
+	if (key === undefined) return undefined;
+	if (key !== 'format_typescript') return engine[key];
+	const sourceType = source_type_for_document(document);
+	return (source) => engine.format_typescript(source, { sourceType });
 };
 
-const report_format_failure = (document: vscode.TextDocument, err: unknown): void => {
+// whether a failed WASM engine reinstantiation has already been logged — the line is
+// the same every time, so it is one per session rather than one per trap. `cli.js`
+// latches the ATTEMPT as well, which is right for a run that ends; an editor session
+// outlives the condition that failed one, so here every trap tries again
+let engine_recovery_logged = false;
+
+/**
+ * Whether a throw out of the engine is the engine failing rather than the document
+ * being rejected: a WASM trap (`WebAssembly.RuntimeError` — input nested past the
+ * module's own stack) or V8's `RangeError` (its native stack ran out first). A parse
+ * error is a plain `Error`. The same split `cli.js` reads to recover between files.
+ */
+const is_engine_failure = (err: unknown): boolean =>
+	err instanceof WebAssembly.RuntimeError || err instanceof RangeError;
+
+/**
+ * Recover the engine after a trap, returning the suffix the reported message carries.
+ * A trap poisons the whole instance, so without this every later save in the window
+ * reports a bogus `memory access out of bounds` — a formatter that stays broken until
+ * the user reloads. Mirrors `cli.js`'s `recover_engine_suffix`, whose wording this
+ * restates: the engine hook is the package's, the line is the extension's own (the CLI
+ * writes its to stderr, per file, with no channel to log to).
+ */
+const recover_engine = (engine: TsvEngine, cause: unknown): string => {
+	const trapped = cause instanceof WebAssembly.RuntimeError;
+	try {
+		engine.reinstantiate();
+		return trapped
+			? ' (WASM engine trapped and was reinstantiated)'
+			: ' (WASM engine reinstantiated)';
+	} catch (err) {
+		if (!engine_recovery_logged) {
+			engine_recovery_logged = true;
+			log_line(
+				`could not reinstantiate the WASM engine after ${trapped ? 'a trap' : 'a RangeError'} (${to_error_message(err)}); later saves may fail`
+			);
+		}
+		return trapped
+			? ' (WASM engine trapped; reinstantiation failed)'
+			: ' (WASM engine reinstantiation failed)';
+	}
+};
+
+/** Report a document the engine would not format. `engine_failure` is the recovery
+ * suffix when the engine failed rather than the document being rejected, `''` for a
+ * parse error — the one the status tooltip names too. */
+const report_format_failure = (
+	document: vscode.TextDocument,
+	err: unknown,
+	engine_failure: string
+): void => {
 	last_failure_uri = document.uri.toString();
 	log_line(document.uri.fsPath);
-	output_channel?.appendLine(to_error_message(err));
+	output_channel?.appendLine(`${to_error_message(err)}${engine_failure}`);
 	output_channel?.appendLine('');
 	if (status_item) {
 		const relative = vscode.workspace.asRelativePath(document.uri);
+		const reason = engine_failure === '' ? 'parse error' : 'engine error';
 		status_item.text = '$(warning) tsv';
-		status_item.tooltip = `tsv: could not format ${relative} (parse error) — click to view output`;
+		status_item.tooltip = `tsv: could not format ${relative} (${reason}) — click to view output`;
 		status_item.show();
 	}
 };
@@ -950,18 +1159,29 @@ const clear_format_failure = (document: vscode.TextDocument): void => {
  * edits, leaving the file untouched. An unchanged result also returns no edits,
  * so a clean file is never marked dirty.
  */
-const format_document = (
-	document: vscode.TextDocument,
-	formatters: TsvFormatters
-): vscode.TextEdit[] => {
-	const format = formatter_for_document(document, formatters);
+const format_document = (document: vscode.TextDocument, engine: TsvEngine): vscode.TextEdit[] => {
+	const format = formatter_for_document(document, engine);
 	if (!format) return [];
 	// honor .gitignore / .formatignore / .prettierignore on save (and explicit
 	// Format Document — VSCode routes both through this provider with no way to
 	// tell them apart, so both skip an ignored file, matching prettier-vscode)
-	// TODO: once the pinned range carries it, log `path_shadow_warning(rel,
-	// loose_root)` when `is_path_pruned` skips a save, deduped per folder reload
-	if (is_document_ignored(document)) {
+	let ignored: boolean;
+	try {
+		ignored = is_document_ignored(document);
+	} catch (err) {
+		// the matcher runs the same WASM instance the formatter does, but it is fed
+		// cached text and a relative path — it has no document to reject, so ANY throw
+		// here is the engine failing, whatever its class. That matters: a trap the
+		// recovery could not clear leaves the instance throwing from the next call in,
+		// and not always a `RuntimeError` (a stranded borrow surfaces as a plain
+		// `Error`), so classifying by where it threw rather than by its class is what
+		// lets a later save heal the engine — and keeps the provider from throwing
+		// back at VSCode, which would lose the Output line. A bug in the layer assembly
+		// would land here too, and reporting one beats throwing it at the host
+		report_format_failure(document, err, recover_engine(engine, err));
+		return [];
+	}
+	if (ignored) {
 		// a skipped document is not formatted at all, so a parse-error indicator it left
 		// before an ignore file came to cover it no longer describes anything
 		clear_format_failure(document);
@@ -972,7 +1192,10 @@ const format_document = (
 	try {
 		formatted = format(source);
 	} catch (err) {
-		report_format_failure(document, err);
+		// here a plain `Error` IS the document being rejected, so only the engine's own
+		// failure shapes recover: a trap poisons the instance, and the CLI likewise
+		// recovers before the next file rather than failing every one after
+		report_format_failure(document, err, is_engine_failure(err) ? recover_engine(engine, err) : '');
 		return [];
 	}
 	clear_format_failure(document);
@@ -984,7 +1207,7 @@ const format_document = (
 /**
  * Registers the single document-formatting provider plus its status-bar
  * indicator, Output channel, and command. Host-agnostic: each entry passes the
- * already-initialized formatters, so this never touches WASM init. Async — it
+ * already-initialized engine, so this never touches WASM init. Async — it
  * awaits the one-time ignore-file load so the skip cache is ready before the
  * (synchronous) provider can run; the per-format path itself stays synchronous.
  *
@@ -992,7 +1215,7 @@ const format_document = (
  */
 export const activate_formatter = async (
 	context: vscode.ExtensionContext,
-	formatters: TsvFormatters,
+	engine: TsvEngine,
 	IgnoreStack: IgnoreStackCtor
 ): Promise<void> => {
 	output_channel = vscode.window.createOutputChannel('tsv');
@@ -1014,7 +1237,7 @@ export const activate_formatter = async (
 
 	const provider: vscode.DocumentFormattingEditProvider = {
 		provideDocumentFormattingEdits(document) {
-			return format_document(document, formatters);
+			return format_document(document, engine);
 		}
 	};
 
@@ -1045,4 +1268,5 @@ export const deactivate_formatter = (): void => {
 	output_channel = undefined;
 	status_item = undefined;
 	last_failure_uri = undefined;
+	engine_recovery_logged = false;
 };

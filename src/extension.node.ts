@@ -1,5 +1,11 @@
 import type * as vscode from 'vscode';
-import { format_css, format_svelte, format_typescript, IgnoreStack } from '@fuzdev/tsv_format_wasm';
+import {
+	format_css,
+	format_svelte,
+	format_typescript,
+	IgnoreStack,
+	reinstantiate
+} from '@fuzdev/tsv_format_wasm';
 import { activate_formatter, deactivate_formatter } from './format_provider.ts';
 
 // Node extension host (desktop, VSCode Server, remote-SSH / WSL / Codespaces):
@@ -8,7 +14,11 @@ import { activate_formatter, deactivate_formatter } from './format_provider.ts';
 // one-time ignore-file load (so the skip cache is ready before the first save);
 // the per-format path stays synchronous.
 export const activate = async (context: vscode.ExtensionContext): Promise<void> => {
-	await activate_formatter(context, { format_css, format_svelte, format_typescript }, IgnoreStack);
+	await activate_formatter(
+		context,
+		{ format_css, format_svelte, format_typescript, reinstantiate },
+		IgnoreStack
+	);
 };
 
 export const deactivate = deactivate_formatter;

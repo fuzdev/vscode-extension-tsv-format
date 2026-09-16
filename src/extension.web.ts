@@ -4,7 +4,8 @@ import {
 	format_svelte,
 	format_typescript,
 	IgnoreStack,
-	init
+	init,
+	reinstantiate
 } from '@fuzdev/tsv_format_wasm';
 import { activate_formatter, deactivate_formatter } from './format_provider.ts';
 
@@ -17,7 +18,13 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
 	const wasm_uri = vscode.Uri.joinPath(context.extensionUri, 'dist', 'web', 'tsv_wasm_bg.wasm');
 	const wasm_bytes = await vscode.workspace.fs.readFile(wasm_uri);
 	await init({ module_or_path: wasm_bytes });
-	await activate_formatter(context, { format_css, format_svelte, format_typescript }, IgnoreStack);
+	// `reinstantiate` is synchronous, which the web host's Worker allows (a browser
+	// main thread would not) — it never recompiles, reusing the module compiled here
+	await activate_formatter(
+		context,
+		{ format_css, format_svelte, format_typescript, reinstantiate },
+		IgnoreStack
+	);
 };
 
 export const deactivate = deactivate_formatter;

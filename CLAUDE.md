@@ -40,18 +40,40 @@ path. The hint set is part of the folder's cached state and is logged only when 
 changes — the watcher fires on every ignore-file save, and an unread file is one line,
 not one per save; a set that shrinks to nothing is silence, not a line. Hints are bounded
 to the directories `tsv format <folder>` descends into: the listing reads the ignore files
-inside a directory a rule or the build-output heuristic prunes too (harmless — a layer
-there changes no verdict), but the CLI's walk never does, so an unreadable or symlinked
-file, or a shadow, in one is not logged. The
-`shadow_warning` hint is *not* surfaced, though it names a real
-misconfiguration: a tsv-layer `!` re-include written under a directory the build-output
-heuristic prunes (`!dist/keep.ts` in a loose folder's `.formatignore`) does nothing, since
-git's parent-directory rule bars a re-include inside an excluded directory. The CLI raises
-it from its walk, at the pruned directory, pointing at the directory-level re-include that
-works; the extension has no walk to raise it from, so a save of such a file is skipped
-silently. The binding past the pinned range answers it per file
-(`path_shadow_warning(rel, loose_root?)`), so logging it on a skipped save waits
-on the range bump.
+inside a directory a rule or the build-output heuristic prunes too, but the CLI's walk
+never does, so an unreadable or symlinked file, or a shadow, in one is not logged. Holding
+those layers in the cache is harmless, and not by luck: a prune short-circuits the ancestor
+walk, so nothing at or below a pruned directory is ever classified, and the matcher's
+`negation_under` — which decides whether a prune carries a warning and which file it names
+— skips every layer anchored at or below the directory it is asked about. The layers
+change no verdict, no warning text and no suggested line.
+
+The **shadow** hint is the one raised on the save path instead. It names a real
+misconfiguration: a tsv-layer `!` re-include written under a directory a prune excludes
+(`!dist/keep.ts` in a loose folder's `.formatignore`) does nothing, since git's
+parent-directory rule bars a re-include inside an excluded directory. The CLI raises it
+from its walk, at the pruned directory, pointing at the directory-level re-include that
+works; the extension has no walk, so `path_shadow_warning(rel, loose_root)` — the per-file
+companion — answers it for the document a prune just skipped, and the line goes to the
+channel like the rest. A safety-net prune stays quiet, as it does on a walk.
+
+Its dedupe cannot work like the hint set's, which is recomputed and compared whole on
+every reload: this set is filled by saves, so there is nothing to recompute. What it does
+instead: the text names the *directory* and depends only on layers above it, so it is the
+same line for every file under one — one misconfigured directory is one line however many
+of its files are saved — and a reload that read the same bytes carries the set forward, so
+a watcher event for an unrelated ignore-file save does not repeat it. A reload whose layers
+really moved starts over, which is the closest a save-driven set comes to "log it only when
+it changed".
+
+`loose_root` shapes only how the line prints paths, and it gets the folder's display path
+in **both** regimes, so every line the channel carries names its files the same way —
+`repo/dist`, `repo/.formatignore`, beside the `repo/b/.prettierignore` the other hints
+print. Left `undefined` it would render the CLI's own way, which the extension cannot
+honestly reproduce: the CLI's format root is the repo root inside a repo and the
+*filesystem* root outside one, so outside a repo `undefined` names a root-level rule "the
+repo-root `.formatignore`" where there is no repo, and in a multi-root workspace a bare
+`dist` says nothing about which folder it is in.
 
 An ignore file that is **present but unreadable** — a read error, or invalid UTF-8
 (reading is strict UTF-8, as on both CLIs, never a lenient decode into patterns nobody
@@ -72,9 +94,8 @@ A **symlinked `.gitignore`** follows the CLI as well. git never reads a `.gitign
 through a symbolic link in a working tree (gitignore(5)), so neither `tsv` bin applies one,
 and neither does the extension: a listed or folder-root `.gitignore` whose `stat` carries
 the `SymbolicLink` bit is dropped like an unreadable one — no anchor, so the build-output
-heuristic stays on for its subtree — and the CLI's own line (`<path> is a symbolic link,
-which git does not follow in a working tree; its ignore rules are not applied`, restated by
-hand, since the pinned binding predates `gitignore_symlink_warning`) joins the hint set.
+heuristic stays on for its subtree — and the CLI's own line, from the shared matcher's
+`gitignore_symlink_warning`, joins the hint set.
 `.formatignore` and `.prettierignore` keep reading through links, as prettier does.
 
 The listing's view of links is the user's **`search.followSymlinks`** (default on):
@@ -118,8 +139,16 @@ matcher. So the extension **no longer rebuilds any of that in TypeScript** — n
 walk, and not the `heuristic_active` state machine it used to thread by hand (the one
 shared-policy seam it previously kept; it briefly used the per-directory
 `classify_dir` for this before `is_path_pruned` existed). The skip check is just
-`is_ignored(rel, false) || is_path_pruned(rel)`. (`classify_dir` stays the CLI's
-per-directory primitive for a real top-down walk; the extension has none.)
+`is_path_pruned(rel) || is_ignored(rel, false)` — the directory half first, as a walk
+meets it, and asked unconditionally so a prune under a dead `!` re-include is reported
+(above) even for a file a rule also excludes; the walk raising it never reaches the file
+either way. (`classify_dir` stays the CLI's per-directory primitive for a real top-down
+walk; the extension has none.)
+
+The per-document stack pushes each tsv layer by its own kind — `push_formatignore` or
+`push_prettierignore`, not one nameless `push_tsv`. The two match identically; the kind
+is what the shared matcher reads to name the file a rule was written in, so a shadow
+warning about a `.prettierignore`'s re-include says `.prettierignore`.
 
 **An open document is not a named path.** The CLI bounds a path an argument *names* by
 the ignore files alone — the safety nets and the build-output heuristic prune only what a
@@ -132,36 +161,64 @@ generated file wholesale would be a surprise; prettier-vscode skips `node_module
 the same reason. The skip stays silent, as it is for an ignore-file match, so the CLI's
 excluded-argument warning has no counterpart here.
 
-One thing the CLI decides that the extension cannot: `tsv format` reads a path's own
+**The parse goal follows the path, not the languageId.** `tsv format` reads a path's own
 extension and parses `.mjs`/`.mts` as **modules with no script retry**, since those are ES
-modules by name. The extension has no path — it dispatches on `languageId`, where `.mjs`
-arrives as `javascript` and `.mts` as `typescript` — and calls the bare
-`format_typescript(source)`, which takes the module-then-script fallback. So a `.mjs`
-holding a legacy sloppy script (a `with` statement, a leading-zero literal) is
-unformattable from the CLI and formats on save here. Closing that would mean threading
-the file name into the dispatch and passing `{sourceType: 'module'}` — an option the
-pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the range bump.
+modules by name; every other extension names no goal and takes the module-then-script
+fallback, which exists to reach a legacy sloppy script (a `with` statement, a leading-zero
+literal). The extension dispatches on `languageId` — `.mjs` arrives as `javascript`, `.mts`
+as `typescript` — so it reads the goal off the document's `fileName` beside it and passes
+`format_typescript(source, {sourceType})`, restating `tsv_ts::Goal::from_extension` as
+`cli.js` restates it (case-insensitive, off the final component, so a bare `.mjs` dotfile
+is a stem with no extension). The other two formatters **throw** on the key, so only the
+TypeScript dispatch carries it. No source the module grammar accepts is affected: the
+retry fires only on a module parse failure, and the printer never reads the goal.
+
+**A trap does not outlive the document that caused it.** A stack overflow — input nested
+past the WASM module's ~1 MiB shadow stack, which generated and minified code can reach —
+traps and poisons the whole instance, so every later call throws `memory access out of
+bounds`: without recovery, one such document breaks format-on-save for the rest of the
+window. On the **formatter** call the extension reads the same split the CLI does
+(`WebAssembly.RuntimeError` or V8's `RangeError` is the engine failing; a plain `Error` is
+the document being rejected) and calls the package's `reinstantiate()` — a fresh instance
+from the already-compiled module, no recompile — before the next save, exactly as
+`tsv format` does between files. The document is reported like a parse error, with the
+CLI's recovery suffix on the message and `engine error` in the status tooltip.
+
+The **skip check** is graded by where it threw instead of by the error's class: the matcher
+is handed cached text and a relative path, so it has no document to reject and any throw
+out of it is the engine's. That is not pedantry — a poisoned instance does not keep
+throwing `RuntimeError`, since a trapped call can strand a borrow and the next one out is a
+plain `Error`, and the skip check is where a poisoned engine is met first (the matcher is
+built before the document is read). Grading it by origin is what lets a later save heal an
+engine whose own recovery failed, and it keeps the provider from throwing back at VSCode,
+which would lose the Output line entirely. A failed reinstantiation logs once per session,
+but unlike `cli.js` the *attempt* is never latched: a run ends, an editor session outlives
+whatever made one fail. Every `IgnoreStack` the old instance backed is invalidated by the
+swap, which costs nothing here: the provider builds and frees one per call, and the skip
+check has already freed its own before the formatter runs.
 
 ## Layout
 
 - `src/format_provider.ts` — host-agnostic core: the provider, languageId →
   `format_*` dispatch (ts/js/css/svelte only), `.svelte` fileName fallback (now
   defensive — the manifest `contributes.languages` owns the `.svelte` → `svelte`
-  association, so the id is present even without the Svelte extension),
-  status-bar + `tsv` Output channel for parse failures (the indicator clears when the
-  failing document formats, closes, or is skipped because an ignore file now covers it)
-  and the `.prettierignore` heads-ups, and the gitignore-aware skip logic. Per workspace folder it caches `{in_repo, gitignores, formatignores,
-  prettierignores}` — the `.gitignore` / `.formatignore` / `.prettierignore` texts
-  keyed by directory (one `findFiles` listing for the three names, plus an
-  explicit folder-root read as a backstop — VS Code's `**/` does list depth 0, but the
-  root files are the ones that must survive a `findFiles` rejection;
-  `.prettierignore` hierarchically inside a repo, each shadowed per-directory by a
-  sibling `.formatignore`), the `.git` regime flag and the hint set. The listing's
-  exclude is `null` on purpose: `findFiles` applies the user's `files.exclude` on
-  top of any exclude glob and disregards it only for `null` (`search.exclude` never
-  applies, `.gitignore` is not consulted), and a `**/dist` there would hide an
-  ignore file the CLI reads. The safety-net directories are dropped from the
-  listing by hand instead — the walk never descends into them, so an ignore file
+  association, so the id is present even without the Svelte extension — and reading
+  the extension as the CLI reads one, case-insensitively and never off a bare dotfile),
+  the `.mjs`/`.mts` parse goal read off the file name, status-bar + `tsv` Output channel
+  for parse failures and engine traps (the indicator clears when the failing document
+  formats, closes, or is skipped because an ignore file now covers it), the ignore-file
+  heads-ups, and the gitignore-aware skip logic. Per workspace folder it caches `{in_repo,
+  gitignores, formatignores, prettierignores}` — the `.gitignore` / `.formatignore` /
+  `.prettierignore` texts keyed by directory (one `findFiles` listing for the three names,
+  plus an explicit folder-root read as a backstop — VS Code's `**/` does list depth 0, but
+  the root files are the ones that must survive a `findFiles` rejection; `.prettierignore`
+  hierarchically inside a repo, each shadowed per-directory by a sibling `.formatignore`),
+  the `.git` regime flag, the hint set and the shadow lines already logged against this
+  snapshot. The listing's exclude is `null` on purpose: `findFiles` applies the user's
+  `files.exclude` on top of any exclude glob and disregards it only for `null`
+  (`search.exclude` never applies, `.gitignore` is not consulted), and a `**/dist` there
+  would hide an ignore file the CLI reads. The safety-net directories are dropped from
+  the listing by hand instead — the walk never descends into them, so an ignore file
   under one is never read by the CLI either — at the price of one unexcluded walk
   (`node_modules` included) per reload. The state is prebuilt off the save path
   and refreshed via a `FileSystemWatcher` over
@@ -197,7 +254,10 @@ pinned `@fuzdev/tsv_format_wasm` range does not yet accept, so it waits on the r
   its state, its in-flight reload and its `.git` watcher.
 - `src/extension.node.ts` — Node entry; WASM inits synchronously at import.
 - `src/extension.web.ts` — web entry; reads the bundled `.wasm` via
-  `context.extensionUri` + `workspace.fs` and `await init(bytes)` once.
+  `context.extensionUri` + `workspace.fs` and `await init(bytes)` once. Both entries
+  hand the provider the same engine surface — the three formatters plus
+  `reinstantiate`, whose synchronous re-init the web host's Worker allows (a browser
+  main thread would not).
 - `esbuild.js` — dual CJS build; copies `tsv_wasm_bg.wasm` next to each bundle.
 - `icon.png` — 128×128 marketplace icon (`package.json` `icon`); shipped in the
   `.vsix` (not excluded by `.vscodeignore`).
@@ -239,8 +299,10 @@ repo — make the edits and stop, the user commits.
   build + the `test/run.js` smoke test). `npm run package` builds + runs `npx
   @vscode/vsce package` (vsce is not a dependency — it's invoked transiently).
 - Single runtime dependency: `@fuzdev/tsv_format_wasm` — the format-only tsv WASM
-  (the smallest of the three variants). Dev deps: esbuild, typescript,
-  @types/node (24.x, matching the host), @types/vscode (pinned to the
+  (the smallest of the three variants). Its `engines.node` (`>=22`) applies to a
+  `npm install` here, not to the extension host: the package is bundled, and its glue
+  uses nothing past the Node 20 the `engines.vscode` floor ships. Dev deps: esbuild,
+  typescript, @types/node (24.x, matching the host), @types/vscode (pinned to the
   `engines.vscode` floor, not latest).
 - Published to the VSCode Marketplace (`vsce`) and Open VSX (`ovsx`). Version
   bumps and publishing are the maintainer's responsibility.

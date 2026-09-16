@@ -3,12 +3,18 @@
 // `vscode` + an in-memory file tree, across scenarios that mirror the native
 // `tsv format` CLI. A supported, *unformatted* document yields edits when NOT
 // ignored and none when ignored, so "no edits" ⟺ ignored. Run via `npm test`.
-import { format_css, format_svelte, format_typescript, IgnoreStack } from '@fuzdev/tsv_format_wasm';
+import {
+	format_css,
+	format_svelte,
+	format_typescript,
+	IgnoreStack,
+	reinstantiate
+} from '@fuzdev/tsv_format_wasm';
 import { activate_formatter, deactivate_formatter } from '../src/format_provider.ts';
 import * as vscode from 'vscode';
 
 const FOLDER = '/repo';
-const formatters = { format_css, format_svelte, format_typescript };
+const engine = { format_css, format_svelte, format_typescript, reinstantiate };
 const make_context = () => ({ subscriptions: [] as Array<{ dispose(): void }> });
 
 interface World {
@@ -99,9 +105,11 @@ const get_provider = (): { provideDocumentFormattingEdits(d: unknown): unknown[]
 			__get_provider(): { provideDocumentFormattingEdits(d: unknown): unknown[] | undefined };
 		}
 	).__get_provider();
-const get_status = (): { visible: boolean; text: string } =>
+const get_status = (): { visible: boolean; text: string; tooltip: string } =>
 	(
-		vscode as unknown as { __get_status_item(): { visible: boolean; text: string } }
+		vscode as unknown as {
+			__get_status_item(): { visible: boolean; text: string; tooltip: string };
+		}
 	).__get_status_item();
 const fire_close = (doc: unknown): void =>
 	(vscode as unknown as { __fire_close(d: unknown): void }).__fire_close(doc);
@@ -143,10 +151,17 @@ const outside_repo_hint = (dir: string): string =>
 /** The CLI's line for a present-but-unreadable ignore file (`cli.js` `read_ignore_file`). */
 const unreadable_hint = (display_path: string, reason: string): string =>
 	`could not read ${display_path} (${reason}); its ignore rules are not applied`;
-/** The CLI's line for a symlinked `.gitignore` (`tsv_discover::gitignore_symlink_warning`),
- * restated as the extension restates it: the pinned binding predates the method. */
+/** The CLI's line for a symlinked `.gitignore` (`tsv_discover::gitignore_symlink_warning`). */
 const symlink_hint = (display_path: string): string =>
-	`${display_path} is a symbolic link, which git does not follow in a working tree; its ignore rules are not applied`;
+	with_stack((s) => s.gitignore_symlink_warning(display_path));
+/** The shadow warning a pruned directory earns, from the stack the extension assembles
+ * for a file under it: one `.formatignore` at the folder root, the folder's name as the
+ * display root. */
+const shadow_hint_for = (rel: string, formatignore: string): string =>
+	with_stack((s) => {
+		s.push_formatignore('', formatignore);
+		return s.path_shadow_warning(rel, 'repo');
+	}) ?? '';
 const permission_reason = (rel: string): string =>
 	`EACCES: permission denied, open '${FOLDER}/${rel}'`;
 /** The Output lines are `[<iso timestamp>] <hint>`; compare on the hint alone. */
@@ -197,7 +212,7 @@ const run_scenario = async (
 	set_world(world);
 	const ctx = make_context();
 	// activation awaits the initial ignore-file load, so the cache is ready here
-	await activate_formatter(ctx as never, formatters, IgnoreStack as never);
+	await activate_formatter(ctx as never, engine, IgnoreStack as never);
 	const provider = get_provider();
 	for (const [rel, languageId, expected] of cases) {
 		const content =
@@ -223,7 +238,7 @@ const run_scenario = async (
 const run_dispatch_cases = async (): Promise<void> => {
 	set_world(build_world({}, false));
 	const ctx = make_context();
-	await activate_formatter(ctx as never, formatters, IgnoreStack as never);
+	await activate_formatter(ctx as never, engine, IgnoreStack as never);
 	const provider = get_provider();
 	const status = get_status();
 	const edits = (doc: unknown): unknown[] => provider.provideDocumentFormattingEdits(doc) ?? [];
@@ -248,26 +263,130 @@ const run_dispatch_cases = async (): Promise<void> => {
 		'dispatch: json unsupported -> no edits',
 		edits(make_doc('data.json', 'json', UNFORMATTED_TS)).length === 0
 	);
-	// `.svelte` extension fallback when the languageId isn't `svelte` (Svelte ext absent)
+	// `.svelte` extension fallback when the languageId isn't `svelte` (Svelte ext absent),
+	// read as the CLI reads an extension: case-insensitively, and never off a bare dotfile
 	expect(
 		'dispatch: .svelte fallback -> edits',
 		edits(make_doc('weird.svelte', 'plaintext', UNFORMATTED_SVELTE)).length === 1
+	);
+	expect(
+		'dispatch: .SVELTE fallback -> edits',
+		edits(make_doc('weird.SVELTE', 'plaintext', UNFORMATTED_SVELTE)).length === 1
+	);
+	// a file named `.svelte` is a stem with no extension, which the CLI parses as
+	// TypeScript — so the fallback must not claim it for the Svelte formatter
+	expect(
+		'dispatch: bare .svelte dotfile -> no svelte dispatch',
+		edits(make_doc('.svelte', 'plaintext', UNFORMATTED_SVELTE)).length === 0
+	);
+
+	// the parse goal a path's extension settles, as `tsv format` reads it: a legacy
+	// sloppy script formats from a `.js`/`.ts` (no goal named -> module, retried as a
+	// script) and is a parse error from a `.mjs`/`.mts`, which are modules by name
+	const SLOPPY_SCRIPT = 'with(x){y}';
+	expect(
+		'dispatch: .js sloppy script -> edits',
+		edits(make_doc('legacy.js', 'javascript', SLOPPY_SCRIPT)).length === 1
+	);
+	expect(
+		'dispatch: .mjs sloppy script -> no edits',
+		edits(make_doc('legacy.mjs', 'javascript', SLOPPY_SCRIPT)).length === 0
+	);
+	expect(
+		'dispatch: .MTS sloppy script -> no edits (the extension is read case-insensitively)',
+		edits(make_doc('legacy.MTS', 'typescript', SLOPPY_SCRIPT)).length === 0
+	);
+	// a bare dotfile is a stem with no extension, so it takes the fallback
+	expect(
+		'dispatch: bare .mjs dotfile -> edits',
+		edits(make_doc('.mjs', 'javascript', SLOPPY_SCRIPT)).length === 1
+	);
+	// a module-grammar source is untouched by the goal
+	expect(
+		'dispatch: .mjs module -> edits',
+		edits(make_doc('mod.mjs', 'javascript', UNFORMATTED_TS)).length === 1
 	);
 
 	// parse error -> no edits (file left unchanged) + the status indicator is shown
 	const bad = make_doc('bad.ts', 'typescript', 'const x = (');
 	expect('dispatch: parse error -> no edits', edits(bad).length === 0);
 	expect('dispatch: parse error -> status shown', status.visible && status.text.includes('tsv'));
+	expect('dispatch: parse error -> named as one', status.tooltip.includes('(parse error)'));
 	// closing the failing document clears the indicator
 	fire_close(bad);
 	expect('dispatch: close clears status', !status.visible);
 
+	// an engine trap — input nested past the WASM module's ~1 MiB shadow stack — is not
+	// this document's failure but the instance's, and it poisons it: every later call
+	// throws `memory access out of bounds` until a fresh instance replaces it. The
+	// provider reinstantiates before the next save, as `tsv format` does between files,
+	// so the trap costs exactly the one document
+	const nested = `${'('.repeat(6000)}1${')'.repeat(6000)}`;
+	expect(
+		'dispatch: engine trap -> no edits',
+		edits(make_doc('nested.ts', 'typescript', nested)).length === 0
+	);
+	expect(
+		'dispatch: engine trap -> named as one, not a parse error',
+		status.visible && status.tooltip.includes('(engine error)')
+	);
+	expect(
+		'dispatch: the engine survives the trap',
+		edits(make_doc('after.ts', 'typescript', UNFORMATTED_TS)).length === 1
+	);
+
 	deactivate_formatter();
+};
+
+/**
+ * A recovery that fails leaves the instance poisoned, and the next save meets it in the
+ * SKIP CHECK — the matcher is built before the document is read — so the provider must
+ * report that rather than throw it back at VSCode. `reinstantiate` is stubbed to a no-op
+ * to hold the poisoning; the real one restores the engine for the rest of the run.
+ */
+const run_dead_engine_case = async (): Promise<void> => {
+	set_world(build_world({}, false));
+	const ctx = make_context();
+	// a gate over the real hook, so the trap's own recovery can be held off and then let
+	// through — the two states a session can be in
+	let allow_recovery = false;
+	const gated = {
+		...engine,
+		reinstantiate: () => {
+			if (allow_recovery) reinstantiate();
+		}
+	};
+	await activate_formatter(ctx as never, gated, IgnoreStack as never);
+	const provider = get_provider();
+	const status = get_status();
+	const edits = (doc: unknown): unknown[] => provider.provideDocumentFormattingEdits(doc) ?? [];
+	const unformatted = () => make_doc('after.ts', 'typescript', UNFORMATTED_TS);
+	edits(make_doc('nested.ts', 'typescript', `${'('.repeat(6000)}1${')'.repeat(6000)}`));
+	let threw = false;
+	let out: unknown[] = [];
+	try {
+		out = edits(unformatted());
+	} catch {
+		threw = true;
+	}
+	expect('dead engine: the provider reports instead of throwing', !threw && out.length === 0);
+	// the matcher's throw after a trap is a plain `Error`, not a `RuntimeError` — graded
+	// by where it came from, not by its class
+	expect('dead engine: reported as an engine error', status.tooltip.includes('(engine error)'));
+	// and the attempt is never latched, so the next save heals the instance
+	allow_recovery = true;
+	edits(unformatted());
+	expect('dead engine: a later save heals it', edits(unformatted()).length === 1);
+	deactivate_formatter();
+	for (const subscription of ctx.subscriptions) subscription.dispose();
+	// a failed assertion above could leave the engine poisoned for the rest of the run
+	reinstantiate();
 };
 
 const main = async (): Promise<void> => {
 	// 0. dispatch / parse-error / status behavior (not ignore-file related)
 	await run_dispatch_cases();
+	await run_dead_engine_case();
 
 	// 1. repo + .gitignore: gitignored dist/ skipped; non-gitignored build/ formatted
 	//    (heuristic OFF in a repo with a .gitignore)
@@ -460,6 +579,66 @@ const main = async (): Promise<void> => {
 			['src.ts', 'typescript', false]
 		]
 	);
+
+	// 6b. loose: a `!dist/keep.ts` re-include reaches INTO a directory the build-output
+	//     heuristic prunes, which git's parent-directory rule makes a silent no-op. The
+	//     CLI raises the shadow warning from its walk, at the pruned directory; the
+	//     extension has no walk, so a skipped save raises it — once per directory,
+	//     however many of its files are saved, and once more after a reload
+	await run_scenario(
+		'loose: a dead re-include into a pruned directory is reported on a skipped save',
+		{
+			'.formatignore': '!dist/keep.ts\n',
+			'dist/keep.ts': UNFORMATTED_TS,
+			'dist/other.ts': UNFORMATTED_TS,
+			'src/a.ts': UNFORMATTED_TS
+		},
+		false,
+		[
+			['dist/keep.ts', 'typescript', true], // the re-include does nothing
+			['dist/other.ts', 'typescript', true],
+			['src/a.ts', 'typescript', false] // a walked directory says nothing
+		],
+		false,
+		async (world) => {
+			const hint = shadow_hint_for('dist/keep.ts', '!dist/keep.ts\n');
+			// both dist/ saves above are one line: the text names the directory, not the file
+			expect_hints('hint: the dead re-include, once for the directory', [hint]);
+			// a safety-net prune is a plain prune, silent on a walk and silent here
+			expect('shadow: node_modules is skipped', is_ignored('node_modules/pkg/a.ts'));
+			expect_hints('hint: a safety-net prune is silent', [hint]);
+			// a reload that read the same bytes carries the dedupe forward
+			fire_watcher('change', '.formatignore');
+			await settle();
+			expect('shadow: still skipped after the reload', is_ignored('dist/keep.ts'));
+			expect_hints('hint: an unchanged reload does not repeat it', [hint]);
+			// an ignore file that really changed starts the set over, as the hint set does
+			world.files.set(`${FOLDER}/.formatignore`, '!dist/keep.ts\n*.log\n');
+			fire_watcher('change', '.formatignore');
+			await settle();
+			expect('shadow: still skipped after the edit', is_ignored('dist/keep.ts'));
+			expect_hints('hint: reported again after the layers changed', [hint, hint]);
+		}
+	);
+
+	// 6c. the tsv layer is pushed by its own KIND, so the warning names the file the rule
+	//     was written in: the same dead re-include in a repo's .prettierignore names that
+	//     file, not the .formatignore it would read as a nameless tsv layer
+	await run_scenario(
+		'a dead re-include in a .prettierignore names that file',
+		{
+			'.prettierignore': '!dist/keep.ts\n',
+			'dist/keep.ts': UNFORMATTED_TS
+		},
+		true, // a repo, so .prettierignore is read; no .gitignore, so the heuristic is on
+		[['dist/keep.ts', 'typescript', true]]
+	);
+	expect_hints('hint: the warning names the .prettierignore', [
+		with_stack((s) => {
+			s.push_prettierignore('', '!dist/keep.ts\n');
+			return s.path_shadow_warning('dist/keep.ts', 'repo');
+		}) ?? ''
+	]);
 
 	// 7. safety nets: node_modules always skipped (repo). Ignore files UNDER a safety
 	//    net are never read by the CLI (it never descends), so they earn no hint here
@@ -962,7 +1141,7 @@ const main = async (): Promise<void> => {
 			release_initial = resolve;
 		});
 		const ctx = make_context();
-		const activation = activate_formatter(ctx as never, formatters, IgnoreStack as never);
+		const activation = activate_formatter(ctx as never, engine, IgnoreStack as never);
 		await settle(); // the initial load holds at the gate
 		let release_newer = (): void => {};
 		world.read_gate = new Promise<void>((resolve) => {
@@ -1006,7 +1185,7 @@ const main = async (): Promise<void> => {
 		world.nested_folders = [`${FOLDER}/packages/a`];
 		set_world(world);
 		const ctx = make_context();
-		await activate_formatter(ctx as never, formatters, IgnoreStack as never);
+		await activate_formatter(ctx as never, engine, IgnoreStack as never);
 		expect('nested folder: root .gitignore reaches it', is_ignored('packages/a/foo.gen.ts'));
 		expect(
 			'nested folder: its .prettierignore is read via the root',
