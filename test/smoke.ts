@@ -9,7 +9,7 @@ import {
 	format_typescript,
 	IgnoreStack,
 	reinstantiate
-} from '@fuzdev/tsv_format_wasm';
+} from '@fuzdev/tsv-format-wasm';
 import { activate_formatter, deactivate_formatter } from '../src/format_provider.ts';
 import * as vscode from 'vscode';
 

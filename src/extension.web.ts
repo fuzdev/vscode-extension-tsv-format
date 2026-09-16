@@ -6,7 +6,7 @@ import {
 	IgnoreStack,
 	init,
 	reinstantiate
-} from '@fuzdev/tsv_format_wasm';
+} from '@fuzdev/tsv-format-wasm';
 import { activate_formatter, deactivate_formatter } from './format_provider.ts';
 
 // Web extension host (vscode.dev / github.dev — a Web Worker): the browser build

@@ -1,5 +1,5 @@
 // Builds and runs the smoke test (test/smoke.ts). esbuild bundles it with
-// `vscode` aliased to the mock and `@fuzdev/tsv_format_wasm` inlined (CJS +
+// `vscode` aliased to the mock and `@fuzdev/tsv-format-wasm` inlined (CJS +
 // import.meta.url shim, like the extension's Node build), copies the `.wasm` next
 // to the bundle, and runs it under Node. Output goes to the OS temp dir so nothing
 // lands in the repo or the shipped `.vsix`. Exits non-zero if any case fails.
@@ -16,7 +16,7 @@ const out_dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsv-ext-smoke-'));
 const out_file = path.join(out_dir, 'smoke.cjs');
 
 const wasm_src = path.join(
-	path.dirname(require.resolve('@fuzdev/tsv_format_wasm/package.json', { paths: [repo] })),
+	path.dirname(require.resolve('@fuzdev/tsv-format-wasm/package.json', { paths: [repo] })),
 	'tsv_wasm_bg.wasm'
 );
 fs.copyFileSync(wasm_src, path.join(out_dir, 'tsv_wasm_bg.wasm'));

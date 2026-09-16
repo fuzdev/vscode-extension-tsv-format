@@ -1,7 +1,7 @@
 # fuzdev.tsv-format
 
 > VSCode extension: format-on-save for TypeScript/JS, Svelte, and CSS,
-> backed by tsv (`@fuzdev/tsv_format_wasm`). Scoped deliberately to **just
+> backed by tsv (`@fuzdev/tsv-format-wasm`). Scoped deliberately to **just
 > formatting** — one canonical, non-configurable style.
 
 **Status**: v1 implemented — builds both hosts, smoke-tested, packages to a
@@ -16,7 +16,7 @@ Targets both the Node host (desktop / VSCode Server / remote) and the web host
 (vscode.dev / github.dev).
 
 It honors the same ignore files the CLI does, via the `IgnoreStack` export from
-`@fuzdev/tsv_format_wasm` — the same matcher, in the CLI's two regimes keyed on
+`@fuzdev/tsv-format-wasm` — the same matcher, in the CLI's two regimes keyed on
 `.git`. **Inside a repo** (a `<folder>/.git` exists): `.gitignore`
 **hierarchically** (one per directory, git-faithful) + `.formatignore`
 **hierarchically** + `.prettierignore` **hierarchically**, each shadowed by a
@@ -298,7 +298,7 @@ repo — make the edits and stop, the user commits.
 - `npm run build` (production) / `npm run watch` / `npm run check` (typecheck +
   build + the `test/run.js` smoke test). `npm run package` builds + runs `npx
   @vscode/vsce package` (vsce is not a dependency — it's invoked transiently).
-- Single runtime dependency: `@fuzdev/tsv_format_wasm` — the format-only tsv WASM
+- Single runtime dependency: `@fuzdev/tsv-format-wasm` — the format-only tsv WASM
   (the smallest of the three variants). Its `engines.node` (`>=22`) applies to a
   `npm install` here, not to the extension host: the package is bundled, and its glue
   uses nothing past the Node 20 the `engines.vscode` floor ships. Dev deps: esbuild,
@@ -310,7 +310,7 @@ repo — make the edits and stop, the user commits.
 ### Publishing & updating
 
 The runtime dependency is **vendored into the bundle**: esbuild inlines
-`@fuzdev/tsv_format_wasm` and copies its `.wasm` into `dist/{node,web}/`, and
+`@fuzdev/tsv-format-wasm` and copies its `.wasm` into `dist/{node,web}/`, and
 `.vscodeignore` excludes `node_modules/**`. So the `.vsix` ships whatever WASM is
 in `node_modules` *at build time* — the published extension does not resolve the
 dependency at install time. Two consequences:
@@ -322,7 +322,7 @@ dependency at install time. Two consequences:
   install` so `package-lock.json` resolves the range from the registry. The
   go/no-go check is "`npm ci` succeeds against the registry."
 - **Updating the formatter = rebuild, not a user dependency bump.** To pick up a
-  new tsv release, bump the `@fuzdev/tsv_format_wasm` range (caret ranges on 0.x
+  new tsv release, bump the `@fuzdev/tsv-format-wasm` range (caret ranges on 0.x
   don't cross minors, so each tsv minor needs a range bump), `npm install`, `npm
   run check`, then re-`package`/publish. There is no runtime auto-update of the
   formatter — its version is frozen into each `.vsix`.

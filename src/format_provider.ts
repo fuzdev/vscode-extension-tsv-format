@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 
 /**
- * The `@fuzdev/tsv_format_wasm` surface the provider runs on: the three
+ * The `@fuzdev/tsv-format-wasm` surface the provider runs on: the three
  * `string -> string` formatters plus the engine's trap-recovery hook. Both extension
  * hosts supply the same functions — only WASM init timing differs.
  *
@@ -26,7 +26,7 @@ export interface TsvEngine {
 }
 
 /**
- * The `IgnoreStack` class exported by `@fuzdev/tsv_format_wasm` — tsv's
+ * The `IgnoreStack` class exported by `@fuzdev/tsv-format-wasm` — tsv's
  * hierarchical, git-faithful discovery matcher. Assembled per document from a
  * workspace folder's `.gitignore` files plus its `.formatignore` and
  * `.prettierignore` hierarchies, so the extension skips exactly the files

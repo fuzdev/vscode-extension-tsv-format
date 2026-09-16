@@ -14,7 +14,7 @@ const watch = process.argv.includes('--watch');
 
 // the format-only WASM lives next to the package's package.json
 const wasm_path = path.join(
-	path.dirname(require.resolve('@fuzdev/tsv_format_wasm/package.json')),
+	path.dirname(require.resolve('@fuzdev/tsv-format-wasm/package.json')),
 	'tsv_wasm_bg.wasm'
 );
 

@@ -5,7 +5,7 @@ import {
 	format_typescript,
 	IgnoreStack,
 	reinstantiate
-} from '@fuzdev/tsv_format_wasm';
+} from '@fuzdev/tsv-format-wasm';
 import { activate_formatter, deactivate_formatter } from './format_provider.ts';
 
 // Node extension host (desktop, VSCode Server, remote-SSH / WSL / Codespaces):
