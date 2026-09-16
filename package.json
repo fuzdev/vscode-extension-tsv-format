@@ -13,10 +13,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/fuzdev/vscode_extension_tsv_format.git"
+    "url": "git+https://github.com/fuzdev/vscode-extension-tsv-format.git"
   },
-  "homepage": "https://github.com/fuzdev/vscode_extension_tsv_format",
-  "bugs": "https://github.com/fuzdev/vscode_extension_tsv_format/issues",
+  "homepage": "https://github.com/fuzdev/vscode-extension-tsv-format",
+  "bugs": "https://github.com/fuzdev/vscode-extension-tsv-format/issues",
   "categories": [
     "Formatters"
   ],
