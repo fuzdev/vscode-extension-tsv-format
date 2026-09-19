@@ -72,7 +72,7 @@
     "package": "npm run build && npx --yes @vscode/vsce package"
   },
   "dependencies": {
-    "@fuzdev/tsv-format-wasm": "^0.4.0"
+    "@fuzdev/tsv-format-wasm": "^0.4.1"
   },
   "devDependencies": {
     "@types/node": "24.13.2",
