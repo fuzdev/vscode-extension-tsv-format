@@ -322,26 +322,30 @@ dependency at install time. Two consequences:
   install` so `package-lock.json` resolves the range from the registry. The
   go/no-go check is "`npm ci` succeeds against the registry."
 - **Updating the formatter = rebuild, not a user dependency bump.** To pick up a
-  new tsv release, bump the `@fuzdev/tsv-format-wasm` range (caret ranges on 0.x
-  don't cross minors, so each tsv minor needs a range bump), `npm install`, `npm
+  new tsv release, bump the `@fuzdev/tsv-format-wasm` range, `npm install`, `npm
   run check`, then re-`package`/publish. There is no runtime auto-update of the
-  formatter — its version is frozen into each `.vsix`.
+  formatter — its version is frozen into each `.vsix`. A minor needs the range
+  bump to resolve at all (a 0.x caret won't cross it); a patch resolves under the
+  existing caret, but bump the floor anyway (`^0.4.0` → `^0.4.1`) so a later
+  resolve can't land back on the pre-fix WASM.
 
 The `engines.vscode` floor (`^1.90.0`) and `@types/vscode` track the **minimum**
 supported host, not latest; raise both together only when a newer host API is
 actually needed.
 
-**What ships** is only `package.json`, `readme.md`, `LICENSE`, `icon.png` and
-`dist/{node,web}/` — `.vscodeignore` keeps the rest out, including `AGENTS.md`
-(a symlink to this file, so excluding `CLAUDE.md` alone doesn't cover it),
-`.claude/**` and `*.local*`. `vsce package` prints the file tree; check it after
-adding any top-level file.
+**What ships** is only `package.json`, `readme.md`, `CHANGELOG.md`, `LICENSE`,
+`icon.png` and `dist/{node,web}/`. `.vscodeignore` is a denylist — a new
+top-level file ships unless it's listed there, so check `vsce package`'s printed
+file tree after adding one. It keeps out `AGENTS.md` (a symlink to this file, so
+excluding `CLAUDE.md` alone doesn't cover it), `.claude/**` and `*.local*`.
 
 **Publish flow** (maintainer-owned — the version bump and both uploads):
 
-1. **Pre-publish checklist** (live confirmation, can't be driven headlessly), below.
-2. Bump `version` in `package.json` and commit, so the `.vsix` builds from a
-   committed tree.
+1. `npm run build`, then the **pre-publish checklist** (live confirmation, can't
+   be driven headlessly), below — it exercises the built `dist/`.
+2. Stamp the changelog's `## Unreleased` section with the new version, naming the
+   tsv version this `.vsix` freezes in. Then bump `version` in `package.json` and
+   commit both, so the `.vsix` builds from a committed tree.
 3. `npm ci` (the provenance go/no-go above) → `npm run check` → `npm run
    package`, which writes `tsv-format-<version>.vsix` to the repo root. `*.vsix`
    is gitignored, so keep a copy outside the repo.
