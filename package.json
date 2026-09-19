@@ -2,7 +2,7 @@
   "name": "tsv-format",
   "displayName": "tsv format — TypeScript, Svelte & CSS",
   "description": "Format-on-save for TypeScript/JS, Svelte, and CSS, powered by tsv. One canonical, non-configurable style.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "icon": "icon.png",
   "publisher": "fuzdev",
   "license": "MIT",

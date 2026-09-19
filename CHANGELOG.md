@@ -7,7 +7,9 @@ it ships.
 
 ## Unreleased
 
-- chore: bundle tsv 0.4.1 (was 0.4.0) — formatting and parsing fixes, tracking
+## 0.1.1
+
+- chore: bundle tsv 0.4.1 — formatting and parsing fixes, tracking
   Svelte 5.57.0. No extension changes; ignore-file handling is unchanged
 
 ## 0.1.0
