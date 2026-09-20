@@ -6,8 +6,8 @@ similar to Prettier + prettier-plugin-svelte.
 
 tsv has one canonical, non-configurable style (like `gofmt` and Python's Black).
 There's no `.prettierrc`, no settings, no plugin discovery.
-It runs in both the desktop and the web
-(`vscode.dev` / `github.dev`) extension hosts using wasm.
+It runs in both the desktop and the web extension hosts
+(like `vscode.dev` and `github.dev`) using wasm.
 (tsv's native builds ship separately as the [`@fuzdev/tsv`](https://www.npmjs.com/package/@fuzdev/tsv)
 npm package, outside this extension.)
 
