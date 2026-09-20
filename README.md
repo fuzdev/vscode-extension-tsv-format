@@ -11,6 +11,13 @@ It runs in both the desktop and the web
 (tsv's native builds ship separately as the [`@fuzdev/tsv`](https://www.npmjs.com/package/@fuzdev/tsv)
 npm package, outside this extension.)
 
+## Install
+
+`fuzdev.tsv-format` on:
+
+- [VSCode marketplace](https://marketplace.visualstudio.com/items?itemName=fuzdev.tsv-format)
+- [Open VSX Registry](https://open-vsx.org/extension/fuzdev/tsv-format)
+
 ## What it formats
 
 - TypeScript - `.ts`/`.mts`/`.cts`
