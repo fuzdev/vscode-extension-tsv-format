@@ -281,11 +281,6 @@ Beyond `main`/`browser`/`activationEvents`, the manifest carries:
 - `capabilities.virtualWorkspaces: true` — explicit support for the web host's
   virtual workspaces (vscode.dev / github.dev), matching the `browser` entry.
 
-## Committing
-
-`git add` and `git commit` are denied by `.claude/settings.local.json` in this
-repo — make the edits and stop, the user commits.
-
 ## Build & publish
 
 - TypeScript extension, bundled with esbuild as **CommonJS** for two targets:
