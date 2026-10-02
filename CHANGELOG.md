@@ -7,6 +7,11 @@ it ships.
 
 ## Unreleased
 
+## 0.1.2
+
+- chore: bundle tsv 0.5.0 — formatting and parsing fixes and performance
+  improvements. No extension changes; ignore-file handling is unchanged
+
 ## 0.1.1
 
 - chore: bundle tsv 0.4.1 — formatting and parsing fixes, tracking
