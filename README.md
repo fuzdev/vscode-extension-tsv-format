@@ -75,4 +75,4 @@ support - for now tsv formats whole files only.
 
 ## License
 
-[MIT](LICENSE)
+[0BSD](LICENSE)
