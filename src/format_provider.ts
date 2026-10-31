@@ -35,7 +35,7 @@ export interface TsvEngine {
  *
  * Only the members the extension uses are typed here. The stack is built and
  * freed per document (never unwound while traversing), so the package's
- * `pop_gitignore` / `pop_tsv` are omitted — as are `should_format_file` (the
+ * `pop_gitignore` / `pop_override` are omitted — as are `should_format_file` (the
  * extension dispatches by `languageId`, not by extension, so it never needs that
  * helper's filter), `classify_dir` and `shadow_warning` (the per-directory verdict
  * and warning for a top-down *traverser*; the extension has no traversal and uses
