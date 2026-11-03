@@ -76,4 +76,6 @@ support - for now tsv formats whole files only.
 
 ## License
 
-[0BSD](LICENSE)
+[0BSD](LICENSE). The bundled tsv WASM compiles in the WHATWG list of named
+character references, under BSD-3-Clause — see the `NOTICE` shipped beside it in
+`dist/node/` and `dist/web/`.

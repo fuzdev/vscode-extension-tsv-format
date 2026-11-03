@@ -5,7 +5,7 @@
   "version": "0.1.2",
   "icon": "icon.png",
   "publisher": "fuzdev",
-  "license": "0BSD",
+  "license": "0BSD AND BSD-3-Clause",
   "author": {
     "name": "Ryan Atkinson",
     "email": "mail@ryanatkn.com",

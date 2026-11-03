@@ -12,6 +12,9 @@ it ships.
   overflowing the engine's stack. Ignore-file handling is unchanged
 - feat: a Svelte source the formatter refuses to print (a lone CR inside an
   in-tag `//` comment) is reported as `refused` rather than as a parse error
+- chore: ship tsv's `NOTICE` beside the bundled WASM and declare the license
+  `0BSD AND BSD-3-Clause` — the WASM compiles in the WHATWG named character
+  references, under BSD-3-Clause
 
 ## 0.1.2
 

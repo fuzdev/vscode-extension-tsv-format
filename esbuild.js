@@ -12,13 +12,14 @@ const path = require('node:path');
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
 
-// the format-only WASM lives next to the package's package.json
-const wasm_path = path.join(
-	path.dirname(require.resolve('@fuzdev/tsv-format-wasm/package.json')),
-	'tsv_wasm_bg.wasm'
-);
+// the format-only WASM lives next to the package's package.json, beside the NOTICE
+// for the third-party material compiled into it (the WHATWG named character
+// references, BSD-3-Clause), which must travel with every copy of the binary
+const package_dir = path.dirname(require.resolve('@fuzdev/tsv-format-wasm/package.json'));
+const wasm_path = path.join(package_dir, 'tsv_wasm_bg.wasm');
+const notice_path = path.join(package_dir, 'NOTICE');
 
-/** Copies `tsv_wasm_bg.wasm` next to a bundle after each (re)build. */
+/** Copies `tsv_wasm_bg.wasm` and its `NOTICE` next to a bundle after each (re)build. */
 const copy_wasm_plugin = (out_dir) => ({
 	name: 'copy-wasm',
 	setup(build) {
@@ -26,6 +27,7 @@ const copy_wasm_plugin = (out_dir) => ({
 			if (result.errors.length) return;
 			fs.mkdirSync(out_dir, { recursive: true });
 			fs.copyFileSync(wasm_path, path.join(out_dir, 'tsv_wasm_bg.wasm'));
+			fs.copyFileSync(notice_path, path.join(out_dir, 'NOTICE'));
 		});
 	}
 });

@@ -338,7 +338,12 @@ supported host, not latest; raise both together only when a newer host API is
 actually needed.
 
 **What ships** is only `package.json`, `readme.md`, `CHANGELOG.md`, `LICENSE`,
-`icon.png` and `dist/{node,web}/`. `.vscodeignore` is a denylist — a new
+`icon.png` and `dist/{node,web}/`. Each `dist/` target carries, beside its bundle,
+the `.wasm` and the package's own `NOTICE` (`esbuild.js` copies both): the WASM
+compiles in the WHATWG named character references, BSD-3-Clause, so the notice must
+travel with every copy of the binary — hence the manifest license `0BSD AND
+BSD-3-Clause`, copied rather than committed so it always matches the tsv version
+the `.vsix` freezes in. `.vscodeignore` is a denylist — a new
 top-level file ships unless it's listed there, so check `vsce package`'s printed
 file tree after adding one. It keeps out `AGENTS.md` (a symlink to this file, so
 excluding `CLAUDE.md` alone doesn't cover it), `.claude/**` and `*.local*`.
