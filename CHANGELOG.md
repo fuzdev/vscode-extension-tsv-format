@@ -5,7 +5,7 @@ Each release freezes one [tsv](https://github.com/fuzdev/tsv) version into its
 fixes arrive only in a new extension release. Every entry names the tsv version
 it ships.
 
-## Unreleased
+## 0.1.3
 
 - chore: bundle tsv 0.8.0 — formatting and parsing fixes and performance
   improvements; deeply nested input is refused as a parse error instead of
