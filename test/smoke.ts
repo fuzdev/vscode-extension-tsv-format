@@ -93,6 +93,9 @@ const build_world = (
 };
 
 const UNFORMATTED_TS = 'const   x=1';
+// an input tsv's depth limits accept, deep enough to exhaust V8's native stack on this
+// run's cut one (`test/run.js` passes `--stack-size=100`), as tsv's own suite stages it
+const DEEP_TS = `x = ${'['.repeat(250)}1${']'.repeat(250)};`;
 const UNFORMATTED_CSS = 'a{color:red}';
 const UNFORMATTED_SVELTE = '<div   >x</div   >';
 
@@ -316,18 +319,27 @@ const run_dispatch_cases = async (): Promise<void> => {
 	fire_close(bad);
 	expect('dispatch: close clears status', !status.visible);
 
-	// an engine trap — input nested past the WASM module's ~1 MiB shadow stack — is not
-	// this document's failure but the instance's, and it poisons it: every later call
+	// input nested past tsv's depth limits is refused as an ordinary parse error, before
+	// the engine's stacks can overflow
+	const too_deep = `${'('.repeat(6000)}1${')'.repeat(6000)}`;
+	expect(
+		'dispatch: too deep -> no edits',
+		edits(make_doc('too_deep.ts', 'typescript', too_deep)).length === 0
+	);
+	expect('dispatch: too deep -> a parse error', status.tooltip.includes('(parse error)'));
+
+	// an engine failure — here V8's native stack running out on an accepted deep input,
+	// which this run's cut stack stages — is not this document's failure but the
+	// instance's: it strands the shadow stack pointer, and repeated, every later call
 	// throws `memory access out of bounds` until a fresh instance replaces it. The
 	// provider reinstantiates before the next save, as `tsv format` does between files,
-	// so the trap costs exactly the one document
-	const nested = `${'('.repeat(6000)}1${')'.repeat(6000)}`;
+	// so the failure costs exactly the one document
 	expect(
-		'dispatch: engine trap -> no edits',
-		edits(make_doc('nested.ts', 'typescript', nested)).length === 0
+		'dispatch: engine failure -> no edits',
+		edits(make_doc('nested.ts', 'typescript', DEEP_TS)).length === 0
 	);
 	expect(
-		'dispatch: engine trap -> named as one, not a parse error',
+		'dispatch: engine failure -> named as one, not a parse error',
 		status.visible && status.tooltip.includes('(engine error)')
 	);
 	expect(
@@ -361,7 +373,16 @@ const run_dead_engine_case = async (): Promise<void> => {
 	const status = get_status();
 	const edits = (doc: unknown): unknown[] => provider.provideDocumentFormattingEdits(doc) ?? [];
 	const unformatted = () => make_doc('after.ts', 'typescript', UNFORMATTED_TS);
-	edits(make_doc('nested.ts', 'typescript', `${'('.repeat(6000)}1${')'.repeat(6000)}`));
+	// each overflow strands the instance a little further down its shadow stack, until a
+	// call traps — the recovery's suffix names a trap once one has happened
+	for (let i = 0; i < 64; i++) {
+		edits(make_doc('nested.ts', 'typescript', DEEP_TS));
+		if (output_lines().some((line) => line.includes('trapped'))) break;
+	}
+	expect(
+		'dead engine: the overflows end in a trap',
+		output_lines().some((line) => line.includes('trapped'))
+	);
 	let threw = false;
 	let out: unknown[] = [];
 	try {

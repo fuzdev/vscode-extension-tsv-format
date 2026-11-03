@@ -36,7 +36,10 @@ esbuild
 		logLevel: 'warning'
 	})
 	.then(() => {
-		const out = execFileSync('node', [out_file], { encoding: 'utf-8' });
+		// V8's stack cut to a sliver: tsv's depth limits keep every accepted input inside a
+		// default thread's stacks, so the engine-failure cases are staged on a smaller one,
+		// where an accepted deep input exhausts V8's native stack (as tsv's own suite does)
+		const out = execFileSync('node', ['--stack-size=100', out_file], { encoding: 'utf-8' });
 		process.stdout.write(out);
 		fs.rmSync(out_dir, { recursive: true, force: true });
 	})

@@ -7,6 +7,12 @@ it ships.
 
 ## Unreleased
 
+- chore: bundle tsv 0.8.0 — formatting and parsing fixes and performance
+  improvements; deeply nested input is refused as a parse error instead of
+  overflowing the engine's stack. Ignore-file handling is unchanged
+- feat: a Svelte source the formatter refuses to print (a lone CR inside an
+  in-tag `//` comment) is reported as `refused` rather than as a parse error
+
 ## 0.1.2
 
 - chore: bundle tsv 0.5.0 — formatting and parsing fixes and performance

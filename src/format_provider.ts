@@ -1,18 +1,24 @@
 import * as vscode from 'vscode';
+import type { FormatError, FormatResult } from '@fuzdev/tsv-format-wasm';
 
 /**
- * The `@fuzdev/tsv-format-wasm` surface the provider runs on: the three
- * `string -> string` formatters plus the engine's trap-recovery hook. Both extension
- * hosts supply the same functions — only WASM init timing differs.
+ * The `@fuzdev/tsv-format-wasm` surface the provider runs on: the three formatters plus
+ * the engine's trap-recovery hook. Both extension hosts supply the same functions — only
+ * WASM init timing differs.
+ *
+ * Each formatter RETURNS what it concludes about the source — `{ok: true, code}`, or
+ * `{ok: false, error}` for a source that does not parse (or, from `format_svelte`, one it
+ * refuses to print) — and throws only for what no result can report: the engine failing
+ * (a trap, a `RangeError`) or a source over the 4 GiB cap.
  *
  * `format_typescript` takes the parse goal a path's extension settles
  * (`source_type_for_document`); the other two reject the key — Svelte's `<script>` is
  * always a module and CSS has no goal — so they are typed without it.
  */
 export interface TsvEngine {
-	format_typescript: (source: string, options?: { sourceType?: 'module' }) => string;
-	format_css: (source: string) => string;
-	format_svelte: (source: string) => string;
+	format_typescript: (source: string, options?: { sourceType?: 'module' }) => FormatResult;
+	format_css: (source: string) => FormatResult;
+	format_svelte: (source: string) => FormatResult;
 	/**
 	 * Discard a poisoned WASM instance and initialize a fresh one from the
 	 * already-compiled module (never a recompile). A stack overflow — input nested past
@@ -1068,7 +1074,7 @@ const source_type_for_document = (document: vscode.TextDocument): 'module' | und
 const formatter_for_document = (
 	document: vscode.TextDocument,
 	engine: TsvEngine
-): ((source: string) => string) | undefined => {
+): ((source: string) => FormatResult) | undefined => {
 	const key =
 		formatter_keys_by_language[document.languageId] ??
 		(has_extension(document.fileName, 'svelte') ? 'format_svelte' : undefined);
@@ -1085,10 +1091,11 @@ const formatter_for_document = (
 let engine_recovery_logged = false;
 
 /**
- * Whether a throw out of the engine is the engine failing rather than the document
- * being rejected: a WASM trap (`WebAssembly.RuntimeError` — input nested past the
- * module's own stack) or V8's `RangeError` (its native stack ran out first). A parse
- * error is a plain `Error`. The same split `cli.js` reads to recover between files.
+ * Whether a throw out of the formatter is the engine failing: a WASM trap
+ * (`WebAssembly.RuntimeError` — input nested past the module's own stack) or V8's
+ * `RangeError` (its native stack ran out first). A parse error or a refusal is a
+ * returned result, never a throw, and the size cap a plain `Error` — neither class. The
+ * same split `cli.js` reads to recover between files.
  */
 const is_engine_failure = (err: unknown): boolean =>
 	err instanceof WebAssembly.RuntimeError || err instanceof RangeError;
@@ -1121,26 +1128,52 @@ const recover_engine = (engine: TsvEngine, cause: unknown): string => {
 	}
 };
 
-/** Report a document the engine would not format. `engine_failure` is the recovery
- * suffix when the engine failed rather than the document being rejected, `''` for a
- * parse error — the one the status tooltip names too. */
+/** Why a document did not format, as the status tooltip names it. */
+type FormatFailureReason = 'parse error' | 'refused' | 'engine error' | 'error';
+
+/** Report a document the engine would not format: `text` is the Output channel's
+ * account of it, `reason` the status tooltip's. */
 const report_format_failure = (
 	document: vscode.TextDocument,
-	err: unknown,
-	engine_failure: string
+	text: string,
+	reason: FormatFailureReason
 ): void => {
 	last_failure_uri = document.uri.toString();
 	log_line(document.uri.fsPath);
-	output_channel?.appendLine(`${to_error_message(err)}${engine_failure}`);
+	output_channel?.appendLine(text);
 	output_channel?.appendLine('');
 	if (status_item) {
 		const relative = vscode.workspace.asRelativePath(document.uri);
-		const reason = engine_failure === '' ? 'parse error' : 'engine error';
 		status_item.text = '$(warning) tsv';
 		status_item.tooltip = `tsv: could not format ${relative} (${reason}) — click to view output`;
 		status_item.show();
 	}
 };
+
+/** Report the engine failing on a document, recovering it first: the line carries the
+ * recovery's suffix, as `tsv format` prints it. */
+const report_engine_failure = (
+	document: vscode.TextDocument,
+	engine: TsvEngine,
+	err: unknown
+): void => {
+	report_format_failure(
+		document,
+		`${to_error_message(err)}${recover_engine(engine, err)}`,
+		'engine error'
+	);
+};
+
+/** A returned failure's text as the CLI prints it: the one-line `message`, then the
+ * `frame` (the `line:col` header with the excerpt, then the caret line) below it
+ * (`cli.js`'s `failure_text`). */
+const failure_text = (error: FormatError): string => `${error.message}\n${error.frame}`;
+
+/** A parse error, or a source that parses but the formatter refuses to print — a lone CR
+ * inside a Svelte in-tag `//` comment, which the format's line-ending fold would turn into
+ * a line break that ends the comment early. */
+const failure_reason = (error: FormatError): FormatFailureReason =>
+	error.kind === 'parse' ? 'parse error' : 'refused';
 
 const clear_format_failure = (document: vscode.TextDocument): void => {
 	if (last_failure_uri === document.uri.toString()) {
@@ -1155,7 +1188,7 @@ const clear_format_failure = (document: vscode.TextDocument): void => {
  * the same document version it requested them for — closing the bulk-edit race
  * that an async formatter is exposed to.
  *
- * On a parse error it reports to the status bar + Output channel and returns no
+ * On a parse error or refusal it reports to the status bar + Output channel and returns no
  * edits, leaving the file untouched. An unchanged result also returns no edits,
  * so a clean file is never marked dirty.
  */
@@ -1178,7 +1211,7 @@ const format_document = (document: vscode.TextDocument, engine: TsvEngine): vsco
 		// lets a later save heal the engine — and keeps the provider from throwing
 		// back at VSCode, which would lose the Output line. A bug in the layer assembly
 		// would land here too, and reporting one beats throwing it at the host
-		report_format_failure(document, err, recover_engine(engine, err));
+		report_engine_failure(document, engine, err);
 		return [];
 	}
 	if (ignored) {
@@ -1188,17 +1221,24 @@ const format_document = (document: vscode.TextDocument, engine: TsvEngine): vsco
 		return [];
 	}
 	const source = document.getText();
-	let formatted: string;
+	let result: FormatResult;
 	try {
-		formatted = format(source);
+		result = format(source);
 	} catch (err) {
-		// here a plain `Error` IS the document being rejected, so only the engine's own
-		// failure shapes recover: a trap poisons the instance, and the CLI likewise
-		// recovers before the next file rather than failing every one after
-		report_format_failure(document, err, is_engine_failure(err) ? recover_engine(engine, err) : '');
+		// a parse error is a returned result, so a throw here is never the document being
+		// rejected: a trap or a `RangeError` is the engine failing and poisons the instance,
+		// so it recovers before the next save, as the CLI recovers before the next file;
+		// what else throws (the size cap) leaves the instance whole
+		if (is_engine_failure(err)) report_engine_failure(document, engine, err);
+		else report_format_failure(document, to_error_message(err), 'error');
+		return [];
+	}
+	if (!result.ok) {
+		report_format_failure(document, failure_text(result.error), failure_reason(result.error));
 		return [];
 	}
 	clear_format_failure(document);
+	const formatted = result.code;
 	if (formatted === source) return [];
 	const full_range = new vscode.Range(document.positionAt(0), document.positionAt(source.length));
 	return [vscode.TextEdit.replace(full_range, formatted)];

@@ -173,16 +173,25 @@ is a stem with no extension). The other two formatters **throw** on the key, so 
 TypeScript dispatch carries it. No source the module grammar accepts is affected: the
 retry fires only on a module parse failure, and the printer never reads the goal.
 
-**A trap does not outlive the document that caused it.** A stack overflow — input nested
-past the WASM module's ~1 MiB shadow stack, which generated and minified code can reach —
-traps and poisons the whole instance, so every later call throws `memory access out of
-bounds`: without recovery, one such document breaks format-on-save for the rest of the
-window. On the **formatter** call the extension reads the same split the CLI does
-(`WebAssembly.RuntimeError` or V8's `RangeError` is the engine failing; a plain `Error` is
-the document being rejected) and calls the package's `reinstantiate()` — a fresh instance
-from the already-compiled module, no recompile — before the next save, exactly as
-`tsv format` does between files. The document is reported like a parse error, with the
-CLI's recovery suffix on the message and `engine error` in the status tooltip.
+**A rejected document is a returned result, not a throw.** Each formatter returns
+`{ok: true, code}` or `{ok: false, error}` — a parse error (`kind: 'parse'`, input nested
+past tsv's depth limits included) or `format_svelte`'s refusal of a source that parses
+(`kind: 'refused'`, a lone CR in an in-tag `//` comment). The Output channel prints it as
+the CLI does, `message` then `frame`, and the status tooltip names `parse error` or
+`refused`. Only what no result can report throws: the engine failing, or a source over the
+4 GiB cap (a plain `Error`, tooltip `error`, no recovery — the instance is whole).
+
+**A trap does not outlive the document that caused it.** The depth limits keep every
+accepted input inside a default thread's stacks, but a smaller host stack can still
+overflow: V8's `RangeError` strands the shadow stack pointer, and a WASM trap
+(`WebAssembly.RuntimeError`) poisons the whole instance, so every later call throws `memory
+access out of bounds` — without recovery, one such document breaks format-on-save for the
+rest of the window. On either class the extension calls the package's `reinstantiate()` — a
+fresh instance from the already-compiled module, no recompile — before the next save,
+exactly as `tsv format` does between files. The document is reported with the CLI's
+recovery suffix on the message and `engine error` in the status tooltip. The smoke test
+stages this the way tsv's own suite does: `test/run.js` runs it under `--stack-size=100`,
+where an accepted deep input exhausts V8's stack.
 
 The **skip check** is graded by where it threw instead of by the error's class: the matcher
 is handed cached text and a relative path, so it has no document to reject and any throw
@@ -370,9 +379,9 @@ repo) to get the verified mark.
   `workspace.fs` + async `init`). Confirm under **Developer: Show Running
   Extensions** that the extension sits in the **Web Worker** host. Check: ts /
   svelte / css / `.mjs` format, an ignored file is skipped, a syntax error shows
-  the `⚠ tsv` status item and clears once fixed; optionally, a nesting-overflow
-  input (`node -e "console.log('x = ' + '['.repeat(200000) + ']'.repeat(200000))"`)
-  reports an engine error and the next format still works.
+  the `⚠ tsv` status item and clears once fixed; optionally, input nested past
+  tsv's depth limits (`node -e "console.log('x = ' + '['.repeat(200000) + ']'.repeat(200000))"`)
+  reports a parse error and the next format still works.
 - Launch notes: the `npm: watch` preLaunchTask never exits and has no problem
   matcher (no `tasks.json`) — if the launch waits on it, `npm run build` first
   and "Debug Anyway". Uninstall any `.vsix` copy
