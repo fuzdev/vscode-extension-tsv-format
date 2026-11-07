@@ -5,7 +5,7 @@ Each release freezes one [tsv](https://github.com/fuzdev/tsv) version into its
 fixes arrive only in a new extension release. Every entry names the tsv version
 it ships.
 
-## Unreleased
+## 0.1.4
 
 - chore: bundle tsv 0.8.1 — formatting and parsing fixes (more meaning-carrying
   parens and comment placements kept, `prettier-ignore`d type members kept
