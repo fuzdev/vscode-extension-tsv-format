@@ -5,6 +5,13 @@ Each release freezes one [tsv](https://github.com/fuzdev/tsv) version into its
 fixes arrive only in a new extension release. Every entry names the tsv version
 it ships.
 
+## Unreleased
+
+- chore: bundle tsv 0.8.1 — formatting and parsing fixes (more meaning-carrying
+  parens and comment placements kept, `prettier-ignore`d type members kept
+  verbatim) and CSS support for Tailwind v4's `*` wildcard in custom property
+  names. No extension changes; ignore-file handling is unchanged
+
 ## 0.1.3
 
 - chore: bundle tsv 0.8.0 — formatting and parsing fixes and performance
